@@ -1,0 +1,527 @@
+"""
+Rollout Euler hybrid fixed-step map (conserved) vs WENO reference; checkpoint from ``train.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+import matplotlib
+import numpy as np
+import torch
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+_EULER_ROOT = os.path.abspath(os.path.dirname(__file__))
+_REPO_SRC = os.path.join(os.path.dirname(_EULER_ROOT), "src")
+if _REPO_SRC not in sys.path:
+    sys.path.insert(0, _REPO_SRC)
+if _EULER_ROOT not in sys.path:
+    sys.path.insert(0, _EULER_ROOT)
+
+from conslaw.checkpoints import compile_if_requested, load_hybrid_fixedstep_map_1d
+from conslaw.eval_reports import dataset_error_row, save_rollout_reports, save_test_metrics_csv
+from conslaw.models import count_params
+from conslaw.solver import downsample_cell_average
+
+from dataset.data import (
+    build_euler_solver,
+    conserved_to_primitives,
+    enforce_physical_state,
+    make_cell_centered_grid,
+    sample_random_ic,
+    sod_ic,
+)
+
+torch.set_default_dtype(torch.float64)
+
+DEFAULT_FNO_CKPT = "checkpoints/euler_fno_flux_fixedstep.pt"
+LINE_GRID_ALPHA = 0.3
+
+
+def apply_line_grid(ax) -> None:
+    ax.grid(True, alpha=LINE_GRID_ALPHA, linewidth=0.8)
+
+
+def solve_euler_weno_ref(state0_fine, times, dx_fine, bc="periodic", cfl=0.4):
+    solver = build_euler_solver(bc=bc)
+    state = np.asarray(state0_fine, dtype=np.float64).copy()
+    snaps = [state.copy()]
+    t = 0.0
+    for out_idx in range(1, len(times)):
+        t_target = float(times[out_idx])
+        dt_interval = t_target - t
+        state = solver.solve(state, dx=dx_fine, T=dt_interval, cfl=cfl, return_all=False)
+        t = t_target
+        snaps.append(state.copy())
+    return np.stack(snaps, axis=0)
+
+
+def block_average_euler(snaps_hi, upsample):
+    nT = snaps_hi.shape[0]
+    return np.stack(
+        [
+            np.stack([downsample_cell_average(snaps_hi[j][k], upsample) for k in range(3)], axis=0)
+            for j in range(nT)
+        ],
+        axis=0,
+    )
+
+
+def sample_eval_ic(x_fine, rng, ic_mode="random"):
+    if ic_mode == "sod":
+        return sod_ic(x_fine, x0=0.5), "sod"
+    if ic_mode != "random":
+        raise ValueError(f"Unknown ic_mode: {ic_mode}")
+    state0, ic_type = sample_random_ic(x_fine, rng)
+    return state0, ic_type
+
+
+def rel_l1(a, b, eps=1e-12):
+    return np.mean(np.abs(a - b)) / (np.mean(np.abs(b)) + eps)
+
+
+def rel_linf(a, b, eps=1e-12):
+    return np.max(np.abs(a - b)) / (np.max(np.abs(b)) + eps)
+
+
+def display_model_name(name: str) -> str:
+    return {
+        "ref": "Ref",
+        "hybrid": "Hybrid",
+        "fno": "FNO",
+        "cnn": "CNN",
+    }.get(str(name).lower(), str(name))
+
+
+def save_metric_curves_pdf(
+    outdir: str,
+    times: np.ndarray,
+    series: dict[str, np.ndarray],
+    *,
+    metric_label: str,
+    filename: str,
+) -> None:
+    if times.size <= 1:
+        return
+    times_plot = times[1:]
+    ylabel = r"Relative $L^\infty$ error" if "linf" in metric_label.lower() else r"Relative $L^1$ error"
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for model_name, values in series.items():
+        mean = values.mean(axis=0)[1:]
+        std = values.std(axis=0)[1:]
+        ax.plot(times_plot, mean, label=display_model_name(model_name))
+        ax.fill_between(times_plot, mean - std, mean + std, alpha=0.15)
+    ax.set_yscale("log")
+    ax.set_xlabel("t", fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14)
+    ax.legend()
+    apply_line_grid(ax)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, filename), bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_profile_pdf(
+    x: np.ndarray,
+    values: np.ndarray,
+    *,
+    ylabel: str,
+    path: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot(x, values, lw=2)
+    ax.set_xlabel("x", fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14)
+    apply_line_grid(ax)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_xt_pdf(
+    x: np.ndarray,
+    times: np.ndarray,
+    values: np.ndarray,
+    *,
+    title: str,
+    path: str,
+    cmap: str,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
+    dx = float(np.median(np.diff(x))) if x.size > 1 else 1.0
+    extent = [float(x[0]), float(x[-1] + dx), float(times[0]), float(times[-1])]
+    fig, ax = plt.subplots(figsize=(5.6, 5.6))
+    im = ax.imshow(values, origin="lower", aspect="auto", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_xlabel("x", fontsize=14)
+    ax.set_ylabel("t", fontsize=14)
+    ax.set_box_aspect(1)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def primitive_traj_euler(traj: np.ndarray) -> dict[str, np.ndarray]:
+    rho_list = []
+    u_list = []
+    p_list = []
+    for snap in traj:
+        rho, u_vel, p = conserved_to_primitives(snap)
+        rho_list.append(np.asarray(rho, dtype=np.float64))
+        u_list.append(np.asarray(u_vel, dtype=np.float64))
+        p_list.append(np.asarray(p, dtype=np.float64))
+    return {
+        "rho": np.stack(rho_list, axis=0),
+        "u": np.stack(u_list, axis=0),
+        "p": np.stack(p_list, axis=0),
+    }
+
+
+def conserved_traj_euler(traj: np.ndarray) -> dict[str, np.ndarray]:
+    return {
+        "rho": np.asarray(traj[:, 0, :], dtype=np.float64),
+        "m": np.asarray(traj[:, 1, :], dtype=np.float64),
+        "E": np.asarray(traj[:, 2, :], dtype=np.float64),
+    }
+
+
+def save_euler_rollout_visuals(
+    outdir: str,
+    x: np.ndarray,
+    times: np.ndarray,
+    ref_traj: np.ndarray,
+    pred_trajs: dict[str, np.ndarray],
+    *,
+    suffix: str,
+) -> None:
+    ref_primitive = primitive_traj_euler(ref_traj)
+    pred_primitive = {name: primitive_traj_euler(traj) for name, traj in pred_trajs.items()}
+    ref_conserved = conserved_traj_euler(ref_traj)
+    pred_conserved = {name: conserved_traj_euler(traj) for name, traj in pred_trajs.items()}
+
+    def save_variable_family(
+        ref_family: dict[str, np.ndarray],
+        pred_family: dict[str, dict[str, np.ndarray]],
+        labels: dict[str, str],
+        *,
+        file_tag: str,
+    ) -> None:
+        keys = list(labels.keys())
+        fig_final, axes_final = plt.subplots(len(keys), 1, figsize=(8, 3.2 * len(keys) + 0.2), sharex=True)
+        fig_err, axes_err = plt.subplots(len(keys), 1, figsize=(8, 3.2 * len(keys) + 0.2), sharex=True)
+        axes_final = np.atleast_1d(axes_final)
+        axes_err = np.atleast_1d(axes_err)
+
+        for idx, (key, label) in enumerate(labels.items()):
+            ref_values = ref_family[key]
+            save_xt_pdf(
+                x,
+                times,
+                ref_values,
+                title="",
+                path=os.path.join(outdir, f"xt_{file_tag}_{key}_ref{suffix}.pdf"),
+                cmap="viridis",
+            )
+
+            ax_final = axes_final[idx]
+            ax_err = axes_err[idx]
+            ax_final.plot(x, ref_values[-1], label="Ref", lw=2)
+            for name, family in pred_family.items():
+                pred_values = family[key]
+                err_values = np.abs(pred_values - ref_values)
+                ax_final.plot(x, pred_values[-1], label=display_model_name(name))
+                ax_err.plot(x, err_values[-1], label=f"{display_model_name(name)} error")
+                save_xt_pdf(
+                    x,
+                    times,
+                    pred_values,
+                    title="",
+                    path=os.path.join(outdir, f"xt_{file_tag}_{key}_{name}{suffix}.pdf"),
+                    cmap="viridis",
+                )
+                save_xt_pdf(
+                    x,
+                    times,
+                    err_values,
+                    title="",
+                    path=os.path.join(outdir, f"xt_error_{file_tag}_{key}_{name}{suffix}.pdf"),
+                    cmap="magma",
+                    vmin=0.0,
+                    vmax=max(float(err_values.max()), 1e-12),
+                )
+            ax_final.set_ylabel(label, fontsize=14)
+            apply_line_grid(ax_final)
+            ax_err.set_ylabel(f"|{label} err|", fontsize=14)
+            apply_line_grid(ax_err)
+
+        axes_final[0].legend()
+        axes_final[-1].set_xlabel("x", fontsize=14)
+        fig_final.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_final.savefig(os.path.join(outdir, f"final_solution_{file_tag}{suffix}.pdf"), bbox_inches="tight")
+        plt.close(fig_final)
+
+        axes_err[0].legend()
+        axes_err[-1].set_xlabel("x", fontsize=14)
+        fig_err.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_err.savefig(os.path.join(outdir, f"final_error_{file_tag}{suffix}.pdf"), bbox_inches="tight")
+        plt.close(fig_err)
+
+    save_variable_family(
+        ref_primitive,
+        pred_primitive,
+        {"rho": r"$\rho$", "u": r"$u$", "p": r"$p$"},
+        file_tag="primitive",
+    )
+    save_variable_family(
+        ref_conserved,
+        pred_conserved,
+        {"rho": r"$\rho$", "m": r"$m$", "E": r"$E$"},
+        file_tag="conserved",
+    )
+
+
+@torch.no_grad()
+def rollout_hybrid_conserved(step_model, u0_low, n_steps, device, pin_memory: bool):
+    if hasattr(step_model, "eval") and callable(step_model.eval):
+        step_model.eval()
+    u_np = u0_low.T
+    u = torch.from_numpy(u_np).unsqueeze(0)
+    if pin_memory and device.type == "cuda":
+        u = u.pin_memory()
+    u = u.to(device=device, dtype=torch.float64, non_blocking=pin_memory and device.type == "cuda")
+    traj = [u0_low.copy()]
+    for _ in range(n_steps):
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        u = step_model(u).clone()
+        traj.append(u.squeeze(0).cpu().numpy().T)
+    return np.stack(traj, axis=0)
+
+
+@torch.no_grad()
+def evaluate_test_dataset_conserved(step_model, test_pt_path, device, pin_memory: bool, batch_size: int):
+    data = torch.load(test_pt_path, map_location="cpu")
+    u0_all = data["input"].permute(0, 2, 1).to(torch.float64)
+    u1_all = data["output"].permute(0, 2, 1).to(torch.float64)
+    preds = []
+    step_model.eval()
+    for start in range(0, u0_all.size(0), batch_size):
+        u0 = u0_all[start : start + batch_size]
+        if pin_memory and device.type == "cuda":
+            u0 = u0.pin_memory()
+        u0 = u0.to(device=device, dtype=torch.float64, non_blocking=pin_memory and device.type == "cuda")
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        preds.append(step_model(u0).cpu().numpy())
+    return np.concatenate(preds, axis=0), u1_all.numpy()
+
+
+def load_optional_fno(ckpt_fno: str, device: torch.device, no_compile: bool, default_path: str):
+    if not ckpt_fno:
+        return None
+    if not os.path.isfile(ckpt_fno):
+        if ckpt_fno == default_path:
+            print(f"[eval] FNO checkpoint not found, skipping baseline: {ckpt_fno}")
+            return None
+        raise FileNotFoundError(f"FNO checkpoint not found: {ckpt_fno}")
+    model_fno, _ = load_hybrid_fixedstep_map_1d(ckpt_fno, device=device)
+    return compile_if_requested(model_fno, device, no_compile=no_compile)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", type=str, default="checkpoints/euler_hybrid_fixedstep.pt")
+    ap.add_argument(
+        "--ckpt_fno",
+        type=str,
+        default=DEFAULT_FNO_CKPT,
+        help="optional FNO1d baseline; WENO ref computed once for both models",
+    )
+    ap.add_argument("--eval_mode", type=str, default="rollout", choices=("rollout", "test", "both"))
+    ap.add_argument("--test_path", type=str, default=None)
+    ap.add_argument("--test_batch", type=int, default=256)
+    ap.add_argument("--nx_low", type=int, default=256)
+    ap.add_argument("--upsample", type=int, default=4)
+    ap.add_argument("--T", type=float, default=1.0)
+    ap.add_argument("--dt_snap", type=float, default=None)
+    ap.add_argument("--cfl", type=float, default=0.4)
+    ap.add_argument("--x_left", type=float, default=0.0)
+    ap.add_argument("--x_right", type=float, default=1.0)
+    ap.add_argument("--bc", type=str, default=None)
+    ap.add_argument("--data_dir", type=str, default="dataset")
+    ap.add_argument("--n_samples", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ic_mode", type=str, default="random", choices=["random", "sod"])
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--outdir", type=str, default="eval_euler_hybrid_out")
+    ap.add_argument("--plot_one", action="store_true")
+    args = ap.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    if not os.path.isfile(args.ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
+
+    model, ckpt = load_hybrid_fixedstep_map_1d(args.ckpt, device=device)
+    model = compile_if_requested(model, device, no_compile=args.no_compile)
+    model_fno = load_optional_fno(args.ckpt_fno, device, args.no_compile, DEFAULT_FNO_CKPT)
+    print(f"[params] hybrid={count_params(model):,}")
+    if model_fno is not None:
+        print(f"[params] fno={count_params(model_fno):,}")
+    else:
+        print("[params] fno=unavailable")
+    run_rollout = args.eval_mode in ("rollout", "both")
+    run_test = args.eval_mode in ("test", "both")
+    dx_ckpt = float(ckpt.get("dx", 0.0))
+    bc_ckpt = ckpt.get("bc", "periodic")
+    solver_bc_ckpt = ckpt.get("solver_bc")
+    if solver_bc_ckpt is None:
+        solver_bc_ckpt = "outflow" if bc_ckpt == "outflow" else "periodic"
+    bc_eval = solver_bc_ckpt if args.bc is None else args.bc
+
+    dt_k = ckpt.get("dt")
+    if args.dt_snap is not None:
+        dt_snap = float(args.dt_snap)
+    elif dt_k is not None:
+        dt_snap = float(dt_k)
+    else:
+        train_pt = os.path.join(args.data_dir, "train_pv.pt")
+        if os.path.isfile(train_pt):
+            meta = torch.load(train_pt, map_location="cpu")["meta"]
+            dt_snap = float(meta["dt"])
+            print(f"[eval] dt from {train_pt}: {dt_snap}")
+        else:
+            raise ValueError("Pass --dt_snap or ckpt['dt'] or data_dir/train_pv.pt")
+
+    pin_mem = device.type == "cuda"
+    if run_rollout:
+        times = np.arange(0.0, args.T + 1e-12, dt_snap)
+        nT = len(times)
+        n_steps = nT - 1
+
+        nx_low = args.nx_low
+        nx_high = args.upsample * nx_low
+        x_fine, dx_fine = make_cell_centered_grid(args.x_left, args.x_right, nx_high)
+        dx_low = (args.x_right - args.x_left) / nx_low
+        x_low = make_cell_centered_grid(args.x_left, args.x_right, nx_low)[0]
+
+        if dx_ckpt > 0 and abs(dx_low - dx_ckpt) / max(dx_ckpt, 1e-15) > 0.05:
+            print(f"[warn] dx_low={dx_low:g} vs ckpt dx={dx_ckpt:g}")
+
+        rng = np.random.default_rng(args.seed)
+        print(
+            f"[eval Euler hybrid] model_bc={bc_ckpt}, ref_bc={bc_eval}, dt={dt_snap}, "
+            f"nx_low={nx_low}, upsample={args.upsample}"
+        )
+
+        n_eval = 1 if args.ic_mode == "sod" else args.n_samples
+        l1_model = np.zeros((n_eval, nT))
+        linf_model = np.zeros((n_eval, nT))
+        l1_fno = None
+        linf_fno = None
+        if model_fno is not None:
+            l1_fno = np.zeros((n_eval, nT))
+            linf_fno = np.zeros((n_eval, nT))
+        one_pack = None
+        plot_dir = os.path.join(args.outdir, "u0_plots")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        for s in range(n_eval):
+            state0, ic_type = sample_eval_ic(x_fine, rng, ic_mode=args.ic_mode)
+            state0 = enforce_physical_state(state0)
+
+            rho0, u0_vel, p0 = conserved_to_primitives(state0)
+            for values, key, label in zip((rho0, u0_vel, p0), ("rho", "u", "p"), (r"$\rho$", r"$u$", r"$p$")):
+                save_profile_pdf(
+                    x_fine,
+                    np.asarray(values, dtype=np.float64),
+                    ylabel=label,
+                    path=os.path.join(plot_dir, f"u0_{s:04d}_{ic_type}_{key}.pdf"),
+                )
+
+            snaps_hi = solve_euler_weno_ref(state0, times, dx_fine, bc=bc_eval, cfl=args.cfl)
+            ref_low = block_average_euler(snaps_hi, args.upsample)
+            u0_low = ref_low[0]
+            pred = rollout_hybrid_conserved(model, u0_low, n_steps, device, pin_mem)
+            pred_fno = (
+                rollout_hybrid_conserved(model_fno, u0_low, n_steps, device, pin_mem)
+                if model_fno is not None
+                else None
+            )
+
+            for j in range(nT):
+                l1_model[s, j] = rel_l1(pred[j], ref_low[j])
+                linf_model[s, j] = rel_linf(pred[j], ref_low[j])
+                if pred_fno is not None:
+                    l1_fno[s, j] = rel_l1(pred_fno[j], ref_low[j])
+                    linf_fno[s, j] = rel_linf(pred_fno[j], ref_low[j])
+
+            if args.plot_one and one_pack is None:
+                one_pack = (
+                    times.copy(),
+                    ref_low.copy(),
+                    pred.copy(),
+                    pred_fno.copy() if pred_fno is not None else None,
+                )
+
+            print(f"[{s+1}/{n_eval}] done")
+
+        save_euler = dict(
+            times=times,
+            dt=np.array([dt_snap]),
+            dx_low=np.array([dx_low]),
+            nx_low=np.array([nx_low]),
+            l1_model=l1_model,
+            linf_model=linf_model,
+        )
+        rollout_metrics = {"hybrid": {"l1": l1_model, "linf": linf_model}}
+        if l1_fno is not None:
+            save_euler["l1_fno"] = l1_fno
+            save_euler["linf_fno"] = linf_fno
+            rollout_metrics["fno"] = {"l1": l1_fno, "linf": linf_fno}
+        np.savez_compressed(os.path.join(args.outdir, "metrics_hybrid.npz"), **save_euler)
+        rollout_summary_path, rollout_curves_path = save_rollout_reports(args.outdir, times, rollout_metrics)
+
+        l1_series = {"hybrid": l1_model}
+        linf_series = {"hybrid": linf_model}
+        if l1_fno is not None and linf_fno is not None:
+            l1_series["fno"] = l1_fno
+            linf_series["fno"] = linf_fno
+        save_metric_curves_pdf(args.outdir, times, l1_series, metric_label="rel L1", filename="relL1_vs_time.pdf")
+        save_metric_curves_pdf(args.outdir, times, linf_series, metric_label="rel Linf", filename="relLinf_vs_time.pdf")
+
+        if one_pack is not None:
+            suf = "sod" if args.ic_mode == "sod" else f"seed{args.seed}"
+            pred_trajs = {"hybrid": one_pack[2]}
+            if len(one_pack) > 3 and one_pack[3] is not None:
+                pred_trajs["fno"] = one_pack[3]
+            save_euler_rollout_visuals(args.outdir, x_low, one_pack[0], one_pack[1], pred_trajs, suffix=f"_{suf}")
+
+        print(f"[rollout] saved csv: {rollout_summary_path}, {rollout_curves_path}")
+
+    if run_test:
+        test_path = args.test_path or os.path.join(args.data_dir, "test_pv.pt")
+        if not os.path.isfile(test_path):
+            raise FileNotFoundError(f"Test dataset not found: {test_path}")
+        pred_h, target = evaluate_test_dataset_conserved(model, test_path, device, pin_mem, args.test_batch)
+        test_rows = [dataset_error_row("hybrid", pred_h, target)]
+        if model_fno is not None:
+            pred_f, _ = evaluate_test_dataset_conserved(model_fno, test_path, device, pin_mem, args.test_batch)
+            test_rows.append(dataset_error_row("fno", pred_f, target))
+        test_csv_path = save_test_metrics_csv(args.outdir, test_rows)
+        print(f"[test] saved csv: {test_csv_path}")
+
+    print(f"Saved under {args.outdir}")
+
+
+if __name__ == "__main__":
+    main()
