@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conslaw"
+version = "0.1.0"
+dependencies = [
+    "torch",
+    "numpy",
+    "numba",
+    "matplotlib",
+    "scipy",
+    "tqdm",
+    "ptwt",
+    "PyWavelets",
+    "tensorboard"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
