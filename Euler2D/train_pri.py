@@ -1,5 +1,9 @@
 """
-Train Euler2D one-step hybrid residual map on trajectory datasets.
+Train Euler2D primitive-variable hybrid dt-step models.
+
+The dataset stays in conservative form on disk. This script converts states to
+primitive variables [rho, u, v, p] before building one-step pairs, then applies
+a smooth positivity modifier to rho and p at the model output.
 """
 
 from __future__ import annotations
@@ -19,11 +23,15 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from conslaw.models import HybridBackbone2dOutflow, HybridDtStep2d, count_params, maybe_torch_compile, state_dict_for_ckpt
+from conslaw.models import count_params, maybe_torch_compile, state_dict_for_ckpt
 
-from common import (
+from common_pri import (
     DEFAULT_TRAIN_NAME,
     DEFAULT_VAL_NAME,
+    P_FLOOR_DEFAULT,
+    POSITIVE_BETA_DEFAULT,
+    RHO_FLOOR_DEFAULT,
+    build_hybrid_model_from_args,
     configure_runtime,
     evaluate_step_model,
     make_pair_loaders,
@@ -53,34 +61,22 @@ def main() -> None:
     ap.add_argument("--modes2", type=int, default=0)
     ap.add_argument("--mr_kernel", type=int, default=7)
     ap.add_argument("--spectral_pad", type=int, default=4)
-    ap.add_argument(
-        "--backbone2d",
-        type=str,
-        default="outflow",
-        choices=("outflow", "standard"),
-        help="outflow: HybridBackbone2dOutflow (MR blocks with optional ghost padding nets); standard: HybridBackbone2d (replicate/zero-pad MR).",
-    )
-    ap.add_argument("--outflow_ctx_width", type=int, default=0, help="Ghost MLP context width for outflow backbone; 0 = use model default (max(2*mr_kernel,8)).")
+    ap.add_argument("--backbone2d", type=str, default="outflow", choices=("outflow", "standard"))
+    ap.add_argument("--outflow_ctx_width", type=int, default=0)
     ap.add_argument("--bc", type=str, default="outflow", choices=("auto", "periodic", "outflow"))
-    ap.add_argument(
-        "--no_zero_mean_rhs",
-        action="store_true",
-        help="Disable hybrid outflow affine rhs correction / periodic mean removal.",
-    )
+    ap.add_argument("--no_zero_mean_rhs", action="store_true")
+    ap.add_argument("--rho_floor", type=float, default=RHO_FLOOR_DEFAULT)
+    ap.add_argument("--p_floor", type=float, default=P_FLOOR_DEFAULT)
+    ap.add_argument("--positive_beta", type=float, default=POSITIVE_BETA_DEFAULT)
     ap.add_argument("--spec_mu", type=float, default=1e-3)
     ap.add_argument("--spec_kfrac", type=float, default=0.25)
     ap.add_argument("--lap_mu", type=float, default=0.0)
     ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--save", type=str, default="checkpoints/euler2d_hybrid_outflow_1e-2_dt.pt")
+    ap.add_argument("--save", type=str, default="checkpoints/euler2d_hybrid_pri_outflow_1e-2_dt.pt")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--allow_tf32", action="store_true")
     ap.add_argument("--no_compile", action="store_true")
-    ap.add_argument(
-        "--compile_mode",
-        type=str,
-        default="auto",
-        choices=("auto", "default", "reduce-overhead", "max-autotune"),
-    )
+    ap.add_argument("--compile_mode", type=str, default="auto", choices=("auto", "default", "reduce-overhead", "max-autotune"))
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -112,65 +108,40 @@ def main() -> None:
     modes2 = int(args.modes if args.modes2 <= 0 else args.modes2)
     zero_mean_rhs = False if model_bc == "outflow" else (not args.no_zero_mean_rhs)
     project_outflow_rhs = False
-    octx = int(args.outflow_ctx_width) if int(args.outflow_ctx_width) > 0 else None
+
     print(
-        f"[data] dt={dt}, dx={dx}, dy={dy}, nx={nx}, ny={ny}, "
+        f"[data-pri] dt={dt}, dx={dx}, dy={dy}, nx={nx}, ny={ny}, gamma={info['gamma']}, "
         f"train_pairs={info['n_train_pairs']}, val_pairs={info['n_val_pairs']}, "
-        f"train_traj={info['n_train_trajectories']}, val_traj={info['n_val_trajectories']}, "
-        f"dataset_bc={train_meta.get('boundary', '?')}, model_bc={model_bc}, "
-        f"backbone2d={args.backbone2d}, outflow_ctx_width={octx}, "
-        f"zero_mean_rhs={zero_mean_rhs}, project_outflow_rhs={project_outflow_rhs}"
+        f"dataset_bc={train_meta.get('boundary', '?')}, model_bc={model_bc}"
+    )
+    print(
+        f"[positive] rho_floor={args.rho_floor:g}, p_floor={args.p_floor:g}, "
+        f"positive_beta={args.positive_beta:g}, output_modifier=softplus"
     )
 
-    backbone2d = None
-    if args.backbone2d == "outflow":
-        backbone2d = HybridBackbone2dOutflow(
-            width=args.width,
-            n_layers=args.n_layers,
-            modes1=args.modes,
-            modes2=modes2,
-            mr_kernel=args.mr_kernel,
-            in_channels=4,
-            out_channels=4,
-            bc=model_bc,
-            spectral_pad=args.spectral_pad,
-            outflow_ctx_width=octx,
-        )
-    model = HybridDtStep2d(
-        width=args.width,
-        n_layers=args.n_layers,
-        modes1=args.modes,
-        modes2=modes2,
-        mr_kernel=args.mr_kernel,
-        in_channels=4,
-        out_channels=4,
-        bc=model_bc,
-        dx=dx,
-        dy=dy,
-        spectral_pad=args.spectral_pad,
-        zero_mean_rhs=zero_mean_rhs,
-        project_outflow_rhs=project_outflow_rhs,
-        backbone=backbone2d,
-    ).to(device)
-    n_params = count_params(model)
-    model = maybe_torch_compile(
-        model,
-        device,
-        no_compile=args.no_compile,
-        compile_mode=args.compile_mode,
-        fullgraph=False,
+    build_args = dict(vars(args))
+    build_args.update(
+        {
+            "modes2": modes2,
+            "bc": model_bc,
+            "zero_mean_rhs": zero_mean_rhs,
+            "project_outflow_rhs": project_outflow_rhs,
+        }
     )
-    bb = "HybridBackbone2dOutflow" if args.backbone2d == "outflow" else "HybridBackbone2d"
-    print(f"[model] HybridDtStep2d (Euler2D, n_cons=4, backbone={bb}), params={n_params}")
+    model = build_hybrid_model_from_args(build_args, dx=dx, dy=dy).to(device)
+    n_params = count_params(model)
+    model = maybe_torch_compile(model, device, no_compile=args.no_compile, compile_mode=args.compile_mode, fullgraph=False)
+    print(f"[model] euler2d_hybrid_pri_dt, params={n_params:,}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
 
-    best = float("inf")
     save_args = dict(vars(args))
     save_args.update(
         {
+            "primitive": True,
+            "positive_output": "softplus_rho_p",
             "modes2": modes2,
             "in_channels": 4,
             "out_channels": 4,
@@ -180,13 +151,10 @@ def main() -> None:
             "dtype": "float32",
         }
     )
-
+    best = float("inf")
     for ep in range(1, args.epochs + 1):
         model.train()
-        tr_tot = torch.zeros((), device=device)
-        tr_l1 = torch.zeros((), device=device)
-        tr_sp = torch.zeros((), device=device)
-        tr_lap = torch.zeros((), device=device)
+        tr_tot = tr_l1 = tr_sp = tr_lap = 0.0
         nb = 0
         for u0, u1 in train_loader:
             u0 = u0.to(device, non_blocking=pin_mem)
@@ -206,12 +174,12 @@ def main() -> None:
             if args.grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            tr_tot += loss.detach()
-            tr_l1 += loss_l1.detach()
-            tr_sp += loss_spec.detach()
-            tr_lap += loss_lap.detach()
+            tr_tot += float(loss.detach())
+            tr_l1 += float(loss_l1.detach())
+            tr_sp += float(loss_spec.detach())
+            tr_lap += float(loss_lap.detach())
             nb += 1
-            print(f"ep: {ep} batch: {nb}/{len(train_loader)}", end='\r')
+            print(f"ep: {ep} batch: {nb}/{len(train_loader)}", end="\r")
 
         vm = evaluate_step_model(
             model,
@@ -224,14 +192,13 @@ def main() -> None:
             pin_memory=pin_mem,
             model_bc=model_bc,
         )
-        tr_scale = 1.0 / max(nb, 1)
+        scale = 1.0 / max(nb, 1)
         print(
-            f"ep {ep}: tr={(tr_tot * tr_scale).item():.3e} tl1={(tr_l1 * tr_scale).item():.3e} "
+            f"ep {ep}: tr={tr_tot * scale:.3e} tl1={tr_l1 * scale:.3e} "
             f"v={vm['loss']:.3e} vl1={vm['loss_l1']:.3e} "
             f"vsp={vm['spec_w']:.3e} vlap={vm['lap_w']:.3e}"
         )
         sched.step()
-
         if vm["loss"] < best:
             best = vm["loss"]
             torch.save(
@@ -243,7 +210,7 @@ def main() -> None:
                     "nx": nx,
                     "ny": ny,
                     "bc": model_bc,
-                    "kind": "euler2d_hybrid_dt",
+                    "kind": "euler2d_hybrid_pri_dt",
                     "args": save_args,
                 },
                 args.save,

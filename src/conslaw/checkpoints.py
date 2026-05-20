@@ -7,8 +7,10 @@ import torch
 from conslaw.models import (
     CNNDtStep2d,
     FNOFluxBackbone1d,
+    FNODtStep1d,
     FNODtStep2d,
     HybridBackbone2dOutflow,
+    HybridDtStep1d,
     HybridDtStep2d,
     HybridFixedStepMap1d,
     maybe_torch_compile,
@@ -158,6 +160,113 @@ def load_hybrid_fixedstep_map_1d(
         model.load_state_dict(_remap_legacy_fixedstep_1d(sd), strict=True)
     model.to(device)
     return model, ckpt
+
+
+def load_hybrid_dt_step_1d(
+    path: str,
+    device: torch.device | str = "cpu",
+    map_location: str | None = None,
+) -> Tuple[HybridDtStep1d, dict[str, Any]]:
+    """Restore :class:`HybridDtStep1d` (e.g. ``kind`` ends with ``_hybrid_dt``)."""
+    ckpt = torch.load(path, map_location=map_location or device)
+    args = ckpt.get("args", {})
+    kind = str(ckpt.get("kind", ""))
+    if "euler" in kind:
+        n_cons = int(args.get("n_cons", 3))
+    elif "swe" in kind:
+        n_cons = int(args.get("n_cons", 2))
+    elif "burgers" in kind or "pureconvection" in kind:
+        n_cons = int(args.get("n_cons", 1))
+    else:
+        n_cons = int(args.get("n_cons", infer_n_cons_hybrid_dt_1d(ckpt.get("model", {}))))
+
+    model = HybridDtStep1d(
+        width=int(args.get("width", 64)),
+        n_layers=int(args.get("n_layers", args.get("layers", 4))),
+        modes=int(args.get("modes", 16)),
+        mr_kernel=int(args.get("mr_kernel", 5)),
+        n_cons=n_cons,
+        bc=str(ckpt.get("bc", args.get("bc", "periodic"))),
+        dx=float(ckpt.get("dx", args.get("dx", 1.0))),
+        spectral_pad=int(args.get("spectral_pad", 4)),
+        zero_mean_rhs=bool(args.get("zero_mean_rhs", True)),
+        project_outflow_rhs=bool(args.get("project_outflow_rhs", True)),
+    )
+    sd = _prepare_dt_step_state_dict(ckpt["model"])
+    model.load_state_dict(sd, strict=True)
+    model.to(device)
+    return model, ckpt
+
+
+def load_fno_dt_step_1d(
+    path: str,
+    device: torch.device | str = "cpu",
+    map_location: str | None = None,
+) -> Tuple[FNODtStep1d, dict[str, Any]]:
+    """Restore :class:`FNODtStep1d` (FNO ``u + dt * rhs``; e.g. ``kind`` like ``*_fno_baseline_dt``)."""
+    ckpt = torch.load(path, map_location=map_location or device)
+    args = ckpt.get("args", {})
+    kind = str(ckpt.get("kind", ""))
+    if "euler" in kind:
+        n_cons = int(args.get("n_cons", 3))
+    elif "swe" in kind:
+        n_cons = int(args.get("n_cons", 2))
+    elif "burgers" in kind or "pureconvection" in kind:
+        n_cons = int(args.get("n_cons", 1))
+    else:
+        n_cons = int(args.get("n_cons", 1))
+    model = FNODtStep1d(
+        modes=int(args.get("modes", 32)),
+        width=int(args.get("width", 64)),
+        n_layers=int(args.get("n_layers", args.get("layers", 4))),
+        padding=int(args.get("fno_padding", args.get("padding", 2))),
+        in_channels=n_cons,
+        out_channels=n_cons,
+        bc=str(ckpt.get("bc", args.get("bc", "periodic"))),
+        zero_mean_rhs=bool(args.get("zero_mean_rhs", True)),
+    )
+    sd = _prepare_dt_step_state_dict(ckpt["model"])
+    model.load_state_dict(sd, strict=True)
+    model.to(device)
+    return model, ckpt
+
+
+def _has_hybrid_dt1d_backbone_keys(sd: dict[str, Any]) -> bool:
+    return any(k.startswith("backbone.") for k in sd)
+
+
+def load_hybrid_step_map_1d(
+    path: str,
+    device: torch.device | str = "cpu",
+    map_location: str | None = None,
+) -> Tuple[torch.nn.Module, dict[str, Any]]:
+    """
+    Dispatch trained 1D step models:
+
+    * Flux: :class:`HybridFixedStepMap1d` (hybrid or FNO flux trunk).
+    * Dt hybrid: :class:`HybridDtStep1d` (``integrator==u_plus_dt_rhs``, state has ``backbone.``).
+    * Dt FNO: :class:`FNODtStep1d` (``integrator==u_plus_dt_rhs``, state has ``fno.`` only).
+
+    Legacy checkpoints may use ``kind`` containing ``hybrid_dt`` without ``integrator`` set.
+    """
+    ckpt0 = torch.load(path, map_location=map_location or "cpu")
+    integrator = str(ckpt0.get("integrator", ""))
+    kind = str(ckpt0.get("kind", ""))
+    sd = ckpt0.get("model", {}) or {}
+    if integrator == "u_plus_dt_rhs":
+        if _has_hybrid_dt1d_backbone_keys(sd):
+            return load_hybrid_dt_step_1d(path, device=device, map_location=map_location)
+        return load_fno_dt_step_1d(path, device=device, map_location=map_location)
+    if "hybrid_dt" in kind:
+        return load_hybrid_dt_step_1d(path, device=device, map_location=map_location)
+    return load_hybrid_fixedstep_map_1d(path, device=device, map_location=map_location)
+
+
+def infer_n_cons_hybrid_dt_1d(sd: dict[str, Any]) -> int:
+    for key in ("backbone.head.2.weight", "backbone.head.4.weight", "head.2.weight", "head.4.weight"):
+        if key in sd:
+            return int(sd[key].shape[0])
+    return 1
 
 
 def infer_n_cons_fixedstep_1d(sd: dict[str, Any]) -> int:

@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader, TensorDataset
 torch.set_default_dtype(torch.float32)
 
 
-DEFAULT_TRAIN_NAME = "euler2d_quadrant_train.pt"
-DEFAULT_VAL_NAME = "euler2d_quadrant_val.pt"
-DEFAULT_TEST_NAME = "euler2d_quadrant_test.pt"
+DEFAULT_TRAIN_NAME = "euler2d_quadrant_outflow_train_1e-2.pt"
+DEFAULT_VAL_NAME = "euler2d_quadrant_outflow_val_1e-2.pt"
+DEFAULT_TEST_NAME = "euler2d_quadrant_outflow_test_1e-2.pt"
 
 
 def default_num_workers() -> int:

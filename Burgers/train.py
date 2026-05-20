@@ -1,5 +1,5 @@
 """
-Train Burgers hybrid fixed-step map u^{n+1} = u^n - q(u^n) (conslaw HybridFixedStepMap1d).
+Train Burgers: flux map u^{n+1}=u^n-q or dt flow u^{n+1}=u^n+dt*proj(NN) (HybridDtStep1d).
 
 Loss and data layout match Hyperbolic/Burgers/train_burgers_dual_latent_q.py.
 """
@@ -21,6 +21,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from conslaw.models import (
+    HybridDtStep1d,
     HybridFixedStepMap1d,
     count_params,
     maybe_torch_compile,
@@ -187,6 +188,9 @@ def evaluate(
     lap_mu,
     pin_memory: bool,
     model_bc: str,
+    *,
+    dt: float,
+    integrator: str = "flux",
 ):
     model.eval()
     tot = 0.0
@@ -198,7 +202,11 @@ def evaluate(
     for u0, u1 in loader:
         u0 = u0.to(device, non_blocking=pin_memory)
         u1 = u1.to(device, non_blocking=pin_memory)
-        pred = model(u0)
+        if integrator == "dt":
+            dt_b = torch.full((u0.size(0),), dt, device=u0.device, dtype=u0.dtype)
+            pred = model(u0, dt_b)
+        else:
+            pred = model(u0)
         loss, l1, ls, lpf, ll = total_loss_batch(
             pred, u1, spec_mu, spec_kfrac, pred_spec_mu, lap_mu, model_bc
         )
@@ -246,7 +254,24 @@ def main():
     ap.add_argument("--spec_kfrac", type=float, default=0.25)
     ap.add_argument("--pred_spec_mu", type=float, default=0.0)
     ap.add_argument("--lap_mu", type=float, default=0.0)
-    ap.add_argument("--save", type=str, default="checkpoints/burgers_hybrid_fixedstep.pt")
+    ap.add_argument(
+        "--integrator",
+        type=str,
+        default="flux",
+        choices=("flux", "dt"),
+        help="flux: u^{n+1}=u^n-q; dt: u^{n+1}=u^n+dt*proj(NN)",
+    )
+    ap.add_argument(
+        "--no_zero_mean_rhs",
+        action="store_true",
+        help="[integrator=dt, periodic] disable mean removal on raw rhs.",
+    )
+    ap.add_argument(
+        "--project_outflow_rhs",
+        action="store_true",
+        help="[integrator=dt, outflow] use OutflowAffineLearnedQ1d on tilde_rhs.",
+    )
+    ap.add_argument("--save", type=str, default="")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument(
@@ -276,34 +301,67 @@ def main():
     )
     solver_bc = solver_bc_from_meta(train_meta)
     model_bc = model_bc_from_meta_or_arg(train_meta, args.bc)
+    save_path = args.save or (
+        "checkpoints/burgers_hybrid_dt.pt" if args.integrator == "dt" else "checkpoints/burgers_hybrid_fixedstep.pt"
+    )
+    if model_bc == "outflow":
+        zero_mean_rhs = False
+        project_outflow_rhs = bool(args.project_outflow_rhs)
+    else:
+        zero_mean_rhs = not args.no_zero_mean_rhs
+        project_outflow_rhs = True
     print(
         f"[data] N={N}, dx={dx}, dt={dt}, seed={args.seed}, batches/epoch={len(train_loader)}, "
-        f"dataset_boundary={train_meta.get('boundary', '?')}, model_bc={model_bc}, solver_bc(ref)={solver_bc}"
+        f"dataset_boundary={train_meta.get('boundary', '?')}, model_bc={model_bc}, solver_bc(ref)={solver_bc}, "
+        f"integrator={args.integrator}, zero_mean_rhs={zero_mean_rhs}, project_outflow_rhs={project_outflow_rhs}"
     )
 
-    model = HybridFixedStepMap1d(
-        width=args.width,
-        n_layers=args.n_layers,
-        modes=args.modes,
-        mr_kernel=args.mr_kernel,
-        n_cons=1,
-        bc=model_bc,
-        dx=dx,
-        spectral_pad=args.spectral_pad,
-    ).to(device)
-    n_params = count_params(model)
-    model = maybe_torch_compile(
-        model,
-        device,
-        no_compile=args.no_compile,
-        compile_mode=args.compile_mode,
-        fullgraph=False,
-    )
-    print(f"[model] HybridFixedStepMap1d (Burgers), params={n_params}")
+    if args.integrator == "dt":
+        model = HybridDtStep1d(
+            width=args.width,
+            n_layers=args.n_layers,
+            modes=args.modes,
+            mr_kernel=args.mr_kernel,
+            n_cons=1,
+            bc=model_bc,
+            dx=dx,
+            spectral_pad=args.spectral_pad,
+            zero_mean_rhs=zero_mean_rhs,
+            project_outflow_rhs=project_outflow_rhs,
+        ).to(device)
+        n_params = count_params(model)
+        model = maybe_torch_compile(
+            model,
+            device,
+            no_compile=args.no_compile,
+            compile_mode=args.compile_mode,
+            fullgraph=False,
+        )
+        print(f"[model] HybridDtStep1d (Burgers), params={n_params}")
+    else:
+        model = HybridFixedStepMap1d(
+            width=args.width,
+            n_layers=args.n_layers,
+            modes=args.modes,
+            mr_kernel=args.mr_kernel,
+            n_cons=1,
+            bc=model_bc,
+            dx=dx,
+            spectral_pad=args.spectral_pad,
+        ).to(device)
+        n_params = count_params(model)
+        model = maybe_torch_compile(
+            model,
+            device,
+            no_compile=args.no_compile,
+            compile_mode=args.compile_mode,
+            fullgraph=False,
+        )
+        print(f"[model] HybridFixedStepMap1d (Burgers), params={n_params}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     best = 1e30
     n_batches = len(train_loader)
@@ -314,7 +372,11 @@ def main():
         for u0, u1 in train_loader:
             u0 = u0.to(device, non_blocking=pin_mem)
             u1 = u1.to(device, non_blocking=pin_mem)
-            pred = model(u0)
+            if args.integrator == "dt":
+                dt_b = torch.full((u0.size(0),), dt, device=u0.device, dtype=u0.dtype)
+                pred = model(u0, dt_b)
+            else:
+                pred = model(u0)
             loss, loss_l1, loss_spec, loss_pf, loss_lap = total_loss_batch(
                 pred,
                 u1,
@@ -350,6 +412,8 @@ def main():
             args.lap_mu,
             pin_mem,
             model_bc,
+            dt=dt,
+            integrator=args.integrator,
         )
         print(
             f"ep {ep}: tr={tr_tot/nb:.3e} v={vm['loss']:.3e} vl1={vm['l1']:.3e} "
@@ -359,6 +423,12 @@ def main():
 
         if vm["loss"] < best:
             best = vm["loss"]
+            if args.integrator == "dt":
+                kind, integrator_key = "burgers_hybrid_dt", "u_plus_dt_rhs"
+                save_args = {**vars(args), "zero_mean_rhs": zero_mean_rhs, "project_outflow_rhs": project_outflow_rhs}
+            else:
+                kind, integrator_key = "burgers_hybrid_fixedstep", "u_minus_q_projected"
+                save_args = vars(args)
             torch.save(
                 {
                     "model": state_dict_for_ckpt(model),
@@ -367,14 +437,14 @@ def main():
                     "nx": N,
                     "bc": model_bc,
                     "solver_bc": solver_bc,
-                    "kind": "burgers_hybrid_fixedstep",
+                    "kind": kind,
                     "state_rep": "u",
-                    "integrator": "u_minus_q_projected",
-                    "args": vars(args),
+                    "integrator": integrator_key,
+                    "args": save_args,
                 },
-                args.save,
+                save_path,
             )
-            print(f"  [best] -> {args.save}")
+            print(f"  [best] -> {save_path}")
 
 
 if __name__ == "__main__":

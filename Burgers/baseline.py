@@ -1,6 +1,6 @@
 """
-Burgers baseline: same as train.py but ``HybridBackbone1d`` → :class:`FNOFluxBackbone1d` (FNO modes, default 32).
-Still learns ``tilde_q`` and uses ``u^{n+1} = u^n - q`` via :class:`HybridFixedStepMap1d`.
+Burgers FNO baseline: FNO flux map (:class:`FNOFluxBackbone1d` + :class:`HybridFixedStepMap1d`) or
+:class:`FNODtStep1d` (``u + dt * FNO``). Matches train integrator / eval loaders.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ if _SRC not in sys.path:
 
 from conslaw.models import (
     FNOFluxBackbone1d,
+    FNODtStep1d,
     HybridFixedStepMap1d,
     count_params,
     maybe_torch_compile,
@@ -187,6 +188,9 @@ def evaluate(
     lap_mu,
     pin_memory: bool,
     model_bc: str,
+    *,
+    dt: float,
+    integrator: str = "flux",
 ):
     model.eval()
     tot = 0.0
@@ -198,7 +202,11 @@ def evaluate(
     for u0, u1 in loader:
         u0 = u0.to(device, non_blocking=pin_memory)
         u1 = u1.to(device, non_blocking=pin_memory)
-        pred = model(u0)
+        if integrator == "dt":
+            dt_b = torch.full((u0.size(0),), dt, device=u0.device, dtype=u0.dtype)
+            pred = model(u0, dt_b)
+        else:
+            pred = model(u0)
         loss, l1, ls, lpf, ll = total_loss_batch(
             pred, u1, spec_mu, spec_kfrac, pred_spec_mu, lap_mu, model_bc
         )
@@ -246,7 +254,19 @@ def main():
     ap.add_argument("--spec_kfrac", type=float, default=0.25)
     ap.add_argument("--pred_spec_mu", type=float, default=0.0)
     ap.add_argument("--lap_mu", type=float, default=0.0)
-    ap.add_argument("--save", type=str, default="checkpoints/burgers_fno_flux_fixedstep.pt")
+    ap.add_argument(
+        "--integrator",
+        type=str,
+        default="flux",
+        choices=("flux", "dt"),
+        help="flux: FNO flux + u-q; dt: FNODtStep1d.",
+    )
+    ap.add_argument(
+        "--no_zero_mean_rhs",
+        action="store_true",
+        help="[integrator=dt, periodic] disable mean removal on FNO output.",
+    )
+    ap.add_argument("--save", type=str, default="")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument(
@@ -276,43 +296,71 @@ def main():
     )
     solver_bc = solver_bc_from_meta(train_meta)
     model_bc = model_bc_from_meta_or_arg(train_meta, args.bc)
+    save_path = args.save or (
+        "checkpoints/burgers_fno_baseline_dt.pt"
+        if args.integrator == "dt"
+        else "checkpoints/burgers_fno_flux_fixedstep.pt"
+    )
+    zero_mean_rhs = (not args.no_zero_mean_rhs) if model_bc == "periodic" else False
     print(
         f"[data] N={N}, dx={dx}, dt={dt}, seed={args.seed}, batches/epoch={len(train_loader)}, "
-        f"dataset_boundary={train_meta.get('boundary', '?')}, model_bc={model_bc}, solver_bc(ref)={solver_bc}"
+        f"dataset_boundary={train_meta.get('boundary', '?')}, model_bc={model_bc}, solver_bc(ref)={solver_bc}, "
+        f"integrator={args.integrator}, fno zero_mean_rhs={zero_mean_rhs}"
     )
 
-    backbone = FNOFluxBackbone1d(
-        modes=args.modes,
-        width=args.width,
-        n_layers=args.n_layers,
-        n_cons=1,
-        bc=model_bc,
-        padding=args.fno_padding,
-    )
-    model = HybridFixedStepMap1d(
-        width=args.width,
-        n_layers=args.n_layers,
-        modes=args.modes,
-        mr_kernel=args.mr_kernel,
-        n_cons=1,
-        bc=model_bc,
-        dx=dx,
-        spectral_pad=args.spectral_pad,
-        backbone=backbone,
-    ).to(device)
-    n_params = count_params(model)
-    model = maybe_torch_compile(
-        model,
-        device,
-        no_compile=args.no_compile,
-        compile_mode=args.compile_mode,
-        fullgraph=False,
-    )
-    print(f"[model] HybridFixedStepMap1d + FNOFluxBackbone1d (Burgers), modes={args.modes}, params={n_params}")
+    if args.integrator == "dt":
+        model = FNODtStep1d(
+            modes=args.modes,
+            width=args.width,
+            n_layers=args.n_layers,
+            padding=args.fno_padding,
+            in_channels=1,
+            out_channels=1,
+            bc=model_bc,
+            zero_mean_rhs=zero_mean_rhs,
+        ).to(device)
+        n_params = count_params(model)
+        model = maybe_torch_compile(
+            model,
+            device,
+            no_compile=args.no_compile,
+            compile_mode=args.compile_mode,
+            fullgraph=False,
+        )
+        print(f"[model] FNODtStep1d (Burgers), modes={args.modes}, params={n_params}")
+    else:
+        backbone = FNOFluxBackbone1d(
+            modes=args.modes,
+            width=args.width,
+            n_layers=args.n_layers,
+            n_cons=1,
+            bc=model_bc,
+            padding=args.fno_padding,
+        )
+        model = HybridFixedStepMap1d(
+            width=args.width,
+            n_layers=args.n_layers,
+            modes=args.modes,
+            mr_kernel=args.mr_kernel,
+            n_cons=1,
+            bc=model_bc,
+            dx=dx,
+            spectral_pad=args.spectral_pad,
+            backbone=backbone,
+        ).to(device)
+        n_params = count_params(model)
+        model = maybe_torch_compile(
+            model,
+            device,
+            no_compile=args.no_compile,
+            compile_mode=args.compile_mode,
+            fullgraph=False,
+        )
+        print(f"[model] HybridFixedStepMap1d + FNOFluxBackbone1d (Burgers), modes={args.modes}, params={n_params}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     best = 1e30
     n_batches = len(train_loader)
@@ -323,7 +371,11 @@ def main():
         for u0, u1 in train_loader:
             u0 = u0.to(device, non_blocking=pin_mem)
             u1 = u1.to(device, non_blocking=pin_mem)
-            pred = model(u0)
+            if args.integrator == "dt":
+                dt_b = torch.full((u0.size(0),), dt, device=u0.device, dtype=u0.dtype)
+                pred = model(u0, dt_b)
+            else:
+                pred = model(u0)
             loss, loss_l1, loss_spec, loss_pf, loss_lap = total_loss_batch(
                 pred,
                 u1,
@@ -359,6 +411,8 @@ def main():
             args.lap_mu,
             pin_mem,
             model_bc,
+            dt=dt,
+            integrator=args.integrator,
         )
         print(
             f"ep {ep}: tr={tr_tot/nb:.3e} v={vm['loss']:.3e} vl1={vm['l1']:.3e} "
@@ -370,6 +424,11 @@ def main():
             best = vm["loss"]
             save_args = dict(vars(args))
             save_args["backbone"] = "fno"
+            if args.integrator == "dt":
+                save_args["zero_mean_rhs"] = zero_mean_rhs
+                kind, integ_key = "burgers_fno_baseline_dt", "u_plus_dt_rhs"
+            else:
+                kind, integ_key = "burgers_fno_flux_fixedstep", "u_minus_q_projected"
             torch.save(
                 {
                     "model": state_dict_for_ckpt(model),
@@ -378,14 +437,14 @@ def main():
                     "nx": N,
                     "bc": model_bc,
                     "solver_bc": solver_bc,
-                    "kind": "burgers_fno_flux_fixedstep",
+                    "kind": kind,
                     "state_rep": "u",
-                    "integrator": "u_minus_q_projected",
+                    "integrator": integ_key,
                     "args": save_args,
                 },
-                args.save,
+                save_path,
             )
-            print(f"  [best] -> {args.save}")
+            print(f"  [best] -> {save_path}")
 
 
 if __name__ == "__main__":

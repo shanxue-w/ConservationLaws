@@ -5,6 +5,7 @@ Evaluate Euler2D dt-step checkpoints on trajectory test data.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
 
@@ -14,6 +15,7 @@ import torch
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SRC = os.path.join(_ROOT, "src")
@@ -25,7 +27,14 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from conslaw.checkpoints import compile_if_requested, load_hybrid_dt_step_2d
-from conslaw.eval_reports import dataset_error_row, save_rollout_reports, save_test_metrics_csv
+from conslaw.eval_reports import (
+    finalize_dataset_error_row,
+    init_dataset_error_stats,
+    save_rollout_reports,
+    save_test_metrics_csv,
+    save_test_metrics_summary_csv,
+    update_dataset_error_stats,
+)
 from conslaw.models import count_params
 
 from common_periodic import (
@@ -33,17 +42,32 @@ from common_periodic import (
     configure_runtime,
     default_dt_ckpt_path,
     load_trajectory_split,
-    predict_pairs,
     rollout_step_model,
-    select_trajectories,
     states_to_one_step_pairs,
 )
 
 
 DEFAULT_HYBRID_CKPT = default_dt_ckpt_path("hybrid", "periodic")
 DEFAULT_FNO_CKPT = default_dt_ckpt_path("fno", "periodic")
-DEFAULT_CNN_CKPT = default_dt_ckpt_path("cnn", "periodic")
 LINE_GRID_ALPHA = 0.3
+FIELD_MATH_LABELS = {
+    "rho": r"$\rho$",
+    "rhou": r"$\rho u$",
+    "rhov": r"$\rho v$",
+    "E": r"$E$",
+    "u": r"$u$",
+    "v": r"$v$",
+    "p": r"$p$",
+}
+ERROR_MATH_LABELS = {
+    "rho": r"$|\rho-\rho_{\mathrm{ref}}|$",
+    "rhou": r"$|\rho u-(\rho u)_{\mathrm{ref}}|$",
+    "rhov": r"$|\rho v-(\rho v)_{\mathrm{ref}}|$",
+    "E": r"$|E-E_{\mathrm{ref}}|$",
+    "u": r"$|u-u_{\mathrm{ref}}|$",
+    "v": r"$|v-v_{\mathrm{ref}}|$",
+    "p": r"$|p-p_{\mathrm{ref}}|$",
+}
 
 
 def apply_line_grid(ax) -> None:
@@ -63,8 +87,22 @@ def display_model_name(name: str) -> str:
         "ref": "Ref",
         "hybrid": "Hybrid",
         "fno": "FNO",
-        "cnn": "CNN",
     }.get(str(name).lower(), str(name))
+
+
+def select_trajectory_indices(n_total: int, n_samples: int | None, seed: int | None) -> np.ndarray:
+    if n_samples is None or n_samples <= 0 or n_samples >= n_total:
+        return np.arange(n_total, dtype=np.int64)
+    if seed is None:
+        return np.arange(int(n_samples), dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    return rng.choice(n_total, size=int(n_samples), replace=False).astype(np.int64)
+
+
+def sample_tag(sample_idx: int, sample_seed: int | None) -> str:
+    if sample_seed is None:
+        return f"sample_idx{sample_idx:06d}"
+    return f"sample_seed{sample_seed}_idx{sample_idx:06d}"
 
 
 def resolve_input_path(path: str, *, label: str) -> str:
@@ -113,6 +151,18 @@ def load_model_from_ckpt(
     return model, ckpt, resolved_ckpt
 
 
+def load_required_model(
+    ckpt_path: str,
+    device: torch.device,
+    *,
+    no_compile: bool,
+) -> tuple[torch.nn.Module, dict, str]:
+    resolved_ckpt = resolve_input_path(ckpt_path, label="Checkpoint")
+    model, ckpt = load_hybrid_dt_step_2d(resolved_ckpt, device=device)
+    model = compile_if_requested(model, device, no_compile=no_compile)
+    return model, ckpt, resolved_ckpt
+
+
 def load_optional_model(
     ckpt_path: str,
     device: torch.device,
@@ -133,180 +183,301 @@ def load_optional_model(
     return model, ckpt, resolved_ckpt
 
 
+def release_eval_memory(device: torch.device) -> None:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def evaluate_pairs_streaming(
+    model_name: str,
+    model: torch.nn.Module,
+    u0: torch.Tensor,
+    u1: torch.Tensor,
+    dt: float,
+    device: torch.device,
+    *,
+    dtype: torch.dtype = torch.float32,
+    batch_size: int = 32,
+    pin_memory: bool = False,
+    progress_every: int = 0,
+) -> dict[str, object]:
+    stats = init_dataset_error_stats()
+    model.eval()
+    n_total = int(u0.size(0))
+    next_progress = int(progress_every) if progress_every and progress_every > 0 else 0
+    last_progress = 0
+
+    for start in range(0, n_total, batch_size):
+        stop = min(start + batch_size, n_total)
+        batch = u0[start:stop]
+        target_batch = u1[start:stop]
+        if pin_memory and device.type == "cuda":
+            batch = batch.pin_memory()
+        batch = batch.to(device=device, dtype=dtype, non_blocking=pin_memory and device.type == "cuda")
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
+        dt_b = torch.full((batch.size(0),), float(dt), device=device, dtype=dtype)
+        pred = model(batch, dt_b)
+        update_dataset_error_stats(stats, pred.detach().cpu().numpy(), target_batch.numpy())
+        del pred
+        del dt_b
+        del batch
+
+        if next_progress > 0:
+            done = stop
+            while done >= next_progress:
+                print(f"[test:{model_name}] {next_progress}/{n_total}", flush=True)
+                last_progress = next_progress
+                next_progress += int(progress_every)
+
+    if progress_every > 0 and last_progress < n_total:
+        print(f"[test:{model_name}] {n_total}/{n_total}", flush=True)
+    return finalize_dataset_error_row(model_name, stats)
+
+
+def iter_test_models(
+    args: argparse.Namespace,
+    device: torch.device,
+):
+    primary_model, primary_ckpt, primary_path = load_required_model(args.ckpt, device, no_compile=args.no_compile)
+    yield model_label_from_ckpt(primary_ckpt), primary_model, primary_ckpt, primary_path
+    primary_model = None
+    primary_ckpt = None
+    primary_path = None
+    release_eval_memory(device)
+
+    if args.hybrid_only:
+        return
+
+    model_fno, ckpt_fno, path_fno = load_optional_model(
+        args.ckpt_fno,
+        device,
+        no_compile=args.no_compile,
+        default_path=DEFAULT_FNO_CKPT,
+    )
+    if model_fno is not None and ckpt_fno is not None and path_fno is not None:
+        yield model_label_from_ckpt(ckpt_fno), model_fno, ckpt_fno, path_fno
+        model_fno = None
+        ckpt_fno = None
+        path_fno = None
+        release_eval_memory(device)
+
+
 def model_label_from_ckpt(ckpt: dict) -> str:
     kind = str(ckpt.get("kind", ""))
-    if "cnn" in kind:
-        return "cnn"
     if "fno" in kind:
         return "fno"
     return "hybrid"
 
 
-def evaluate_test_dataset(
-    model: torch.nn.Module,
-    test_states: torch.Tensor,
-    dt: float,
-    device: torch.device,
+def conserved_to_primitive_2d(state: np.ndarray, gamma: float) -> dict[str, np.ndarray]:
+    rho = np.asarray(state[0], dtype=np.float64)
+    rho_u = np.asarray(state[1], dtype=np.float64)
+    rho_v = np.asarray(state[2], dtype=np.float64)
+    energy = np.asarray(state[3], dtype=np.float64)
+    u_vel = rho_u / rho
+    v_vel = rho_v / rho
+    kinetic = 0.5 * (rho_u * rho_u + rho_v * rho_v) / rho
+    pressure = (gamma - 1.0) * (energy - kinetic)
+    return {
+        "rho": rho,
+        "u": u_vel,
+        "v": v_vel,
+        "p": pressure,
+    }
+
+
+def state_to_conserved_fields(state: np.ndarray) -> dict[str, np.ndarray]:
+    return {
+        "rho": np.asarray(state[0], dtype=np.float64),
+        "rhou": np.asarray(state[1], dtype=np.float64),
+        "rhov": np.asarray(state[2], dtype=np.float64),
+        "E": np.asarray(state[3], dtype=np.float64),
+    }
+
+
+def field_math_label(key: str) -> str:
+    return FIELD_MATH_LABELS.get(key, str(key))
+
+
+def error_math_label(key: str) -> str:
+    return ERROR_MATH_LABELS.get(key, field_math_label(key))
+
+
+def merged_field_limits(a: dict[str, np.ndarray], b: dict[str, np.ndarray]) -> dict[str, tuple[float, float]]:
+    keys = set(a) & set(b)
+    out: dict[str, tuple[float, float]] = {}
+    for key in keys:
+        lo_a, hi_a = float(np.min(a[key])), float(np.max(a[key]))
+        lo_b, hi_b = float(np.min(b[key])), float(np.max(b[key]))
+        out[key] = (min(lo_a, lo_b), max(hi_a, hi_b))
+    return out
+
+
+class _OneDecimalScalarFormatter(ScalarFormatter):
+    """``ScalarFormatter`` with one decimal place on tick coefficients (ref/hybrid/fno panels share this)."""
+
+    def _set_format(self) -> None:
+        self.format = "%1.1f"
+        if self._usetex or self._useMathText:
+            self.format = r"$\mathdefault{%s}$" % self.format
+
+
+def _style_field_colorbar(cbar) -> None:
+    """Scientific-style colorbar: one decimal on coefficients, ``×10ⁿ`` at axis end; set ``cbar.formatter`` for mpl ≥3.10."""
+    fmt = _OneDecimalScalarFormatter(useMathText=True)
+    fmt.set_scientific(True)
+    fmt.set_powerlimits((-2, 2))
+    cbar.formatter = fmt
+    cbar.ax.yaxis.set_major_formatter(fmt)
+    cbar.update_ticks()
+
+
+def save_state_panel(
+    out_path: str,
+    fields: dict[str, np.ndarray],
     *,
-    batch_size: int,
-    pin_memory: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    u0_test, u1_test = states_to_one_step_pairs(test_states, dtype=torch.float32)
-    pred = predict_pairs(
-        model,
-        u0_test,
-        dt,
-        device,
-        dtype=torch.float32,
-        batch_size=batch_size,
-        pin_memory=pin_memory,
+    cmap: str = "turbo",
+    limits: dict[str, tuple[float, float]] | None = None,
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(9, 8))
+    for ax, key in zip(axes.flat, fields.keys()):
+        vmin, vmax = (limits[key] if limits is not None and key in limits else (None, None))
+        im = ax.imshow(fields[key], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(field_math_label(key))
+        ax.set_xticks([])
+        ax.set_yticks([])
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        _style_field_colorbar(cbar)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_single_field(
+    out_path: str,
+    field: np.ndarray,
+    *,
+    label: str,
+    cmap: str = "turbo",
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    im = ax.imshow(field, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(label)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    _style_field_colorbar(cbar)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_error_map(out_path: str, err: np.ndarray, *, key: str) -> None:
+    vmax = max(float(err.max()), 1e-12)
+    save_single_field(
+        out_path,
+        err,
+        label=error_math_label(key),
+        cmap="turbo",
+        vmin=0.0,
+        vmax=vmax,
     )
-    return pred, u1_test.numpy()
 
 
 def save_density_plots(
     outdir: str,
-    times: np.ndarray,
     ref_traj: np.ndarray,
     pred_trajs: dict[str, np.ndarray],
-    plot_channel: int,
-    yslices: list[float],
+    *,
+    final_time: float,
+    gamma: float,
+    tag: str,
+    share_ref_colorbar: bool = False,
 ) -> None:
-    final_ref = ref_traj[-1, plot_channel]
-    model_names = list(pred_trajs.keys())
+    ref_final = ref_traj[-1]
+    final_states = {"ref": ref_final}
+    for name, traj in pred_trajs.items():
+        final_states[name] = traj[-1]
 
-    def save_slice_pdf(
-        x_coords: np.ndarray,
-        curves: list[tuple[str, np.ndarray]],
-        *,
-        path: str,
-    ) -> None:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        for label, values in curves:
-            ax.plot(x_coords, values, label=label, linewidth=1.8)
-        ax.set_xlabel("x")
-        ax.set_ylabel("value")
-        ax.legend()
-        apply_line_grid(ax)
-        fig.tight_layout()
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
+    conserved_fields = {name: state_to_conserved_fields(state) for name, state in final_states.items()}
+    primitive_fields = {name: conserved_to_primitive_2d(state, gamma=gamma) for name, state in final_states.items()}
+    conserved_shared_limits = (
+        merged_field_limits(conserved_fields["ref"], conserved_fields["hybrid"])
+        if share_ref_colorbar and "hybrid" in conserved_fields
+        else None
+    )
+    primitive_shared_limits = (
+        merged_field_limits(primitive_fields["ref"], primitive_fields["hybrid"])
+        if share_ref_colorbar and "hybrid" in primitive_fields
+        else None
+    )
 
-    def save_field_pdf(
-        field: np.ndarray,
-        *,
-        title: str,
-        path: str,
-        cmap: str,
-        vmin: float | None = None,
-        vmax: float | None = None,
-    ) -> None:
-        fig, ax = plt.subplots(figsize=(5.2, 4.2))
-        im = ax.imshow(field, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-    def save_xt_pdf(
-        x_coords: np.ndarray,
-        xt_values: np.ndarray,
-        *,
-        title: str,
-        path: str,
-        cmap: str,
-        vmin: float | None = None,
-        vmax: float | None = None,
-    ) -> None:
-        dx = float(np.median(np.diff(x_coords))) if x_coords.size > 1 else 1.0
-        extent = [float(x_coords[0]), float(x_coords[-1] + dx), float(times[0]), float(times[-1])]
-        fig, ax = plt.subplots(figsize=(5.6, 5.6))
-        im = ax.imshow(xt_values, origin="lower", aspect="auto", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
-        ax.set_xlabel("x")
-        ax.set_ylabel("t")
-        ax.set_box_aspect(1)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-    final_fields = [pred_trajs[name][-1, plot_channel] for name in model_names]
-    final_figsize = (4.6 * (1 + len(model_names)), 4.2)
-    fig_final, axes_final = plt.subplots(1, 1 + len(model_names), figsize=final_figsize)
-    axes_final = np.atleast_1d(axes_final)
-    for ax, field in zip(
-        axes_final,
-        [final_ref, *final_fields],
-    ):
-        im = ax.imshow(field, origin="lower", cmap="viridis")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig_final.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig_final.tight_layout()
-    fig_final.savefig(os.path.join(outdir, f"final_channel{plot_channel}_states.pdf"), bbox_inches="tight")
-    plt.close(fig_final)
-
-    fig_err, axes_err = plt.subplots(1, len(model_names), figsize=final_figsize)
-    axes_err = np.atleast_1d(axes_err)
-    for ax, name in zip(axes_err, model_names):
-        err = np.abs(pred_trajs[name][-1, plot_channel] - final_ref)
-        im = ax.imshow(err, origin="lower", cmap="magma", vmin=0.0, vmax=max(float(err.max()), 1e-12))
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig_err.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig_err.tight_layout()
-    fig_err.savefig(os.path.join(outdir, f"final_channel{plot_channel}_errors.pdf"), bbox_inches="tight")
-    plt.close(fig_err)
-
-    ny_low, nx_low = final_ref.shape
-    x_coords = np.linspace(0.0, 1.0, nx_low, endpoint=False)
-    final_curve_names = [name for name in ("hybrid", "fno") if name in pred_trajs]
-    if final_curve_names:
-        for y_val in yslices:
-            y_clamped = min(max(float(y_val), 0.0), 1.0)
-            j = int(round(y_clamped * (ny_low - 1)))
-            y_tag = f"{y_clamped:.3f}".replace(".", "p")
-            curves = [("Ref", final_ref[j, :])]
-            for name in final_curve_names:
-                curves.append((display_model_name(name), pred_trajs[name][-1, plot_channel, j, :]))
-            save_slice_pdf(
-                x_coords,
-                curves,
-                path=os.path.join(outdir, f"slice_channel{plot_channel}_final_y{y_tag}.pdf"),
-            )
-
-    for y_val in yslices:
-        y_clamped = min(max(float(y_val), 0.0), 1.0)
-        j = int(round(y_clamped * (ny_low - 1)))
-        y_tag = f"{y_clamped:.3f}".replace(".", "p")
-        ref_xt = ref_traj[:, plot_channel, j, :]
-        save_xt_pdf(
-            x_coords,
-            ref_xt,
-            title="",
-            path=os.path.join(outdir, f"xt_channel{plot_channel}_ref_y{y_tag}.pdf"),
-            cmap="viridis",
+    for name, fields in conserved_fields.items():
+        use_shared = bool(share_ref_colorbar and name in ("ref", "hybrid") and conserved_shared_limits is not None)
+        panel_limits = conserved_shared_limits if use_shared else None
+        out_path = os.path.join(outdir, f"conserved_{name}_{tag}.pdf")
+        save_state_panel(
+            out_path,
+            fields,
+            limits=panel_limits,
         )
-        for name in model_names:
-            pred_xt = pred_trajs[name][:, plot_channel, j, :]
-            err_xt = np.abs(pred_xt - ref_xt)
-            save_xt_pdf(
-                x_coords,
-                pred_xt,
-                title="",
-                path=os.path.join(outdir, f"xt_channel{plot_channel}_{name}_y{y_tag}.pdf"),
-                cmap="viridis",
+        for key, values in fields.items():
+            if use_shared and conserved_shared_limits is not None and key in conserved_shared_limits:
+                vmin, vmax = conserved_shared_limits[key]
+            else:
+                vmin, vmax = None, None
+            save_single_field(
+                os.path.join(outdir, f"conserved_{key}_{name}_{tag}.pdf"),
+                values,
+                label=field_math_label(key),
+                vmin=vmin,
+                vmax=vmax,
             )
-            save_xt_pdf(
-                x_coords,
-                err_xt,
-                title="",
-                path=os.path.join(outdir, f"xt_channel{plot_channel}_error_{name}_y{y_tag}.pdf"),
-                cmap="magma",
-                vmin=0.0,
-                vmax=max(float(err_xt.max()), 1e-12),
+
+    for name, fields in primitive_fields.items():
+        use_shared = bool(share_ref_colorbar and name in ("ref", "hybrid") and primitive_shared_limits is not None)
+        panel_limits = primitive_shared_limits if use_shared else None
+        out_path = os.path.join(outdir, f"primitive_{name}_{tag}.pdf")
+        save_state_panel(
+            out_path,
+            fields,
+            limits=panel_limits,
+        )
+        for key, values in fields.items():
+            if use_shared and primitive_shared_limits is not None and key in primitive_shared_limits:
+                vmin, vmax = primitive_shared_limits[key]
+            else:
+                vmin, vmax = None, None
+            save_single_field(
+                os.path.join(outdir, f"primitive_{key}_{name}_{tag}.pdf"),
+                values,
+                label=field_math_label(key),
+                vmin=vmin,
+                vmax=vmax,
+            )
+
+    ref_cons = conserved_fields["ref"]
+    ref_prim = primitive_fields["ref"]
+    for name in pred_trajs:
+        for key, values in conserved_fields[name].items():
+            err = np.abs(values - ref_cons[key])
+            file_key = "cons_rho" if key == "rho" else key
+            save_error_map(
+                os.path.join(outdir, f"error_{file_key}_{name}_{tag}.pdf"),
+                err,
+                key=key,
+            )
+        for key, values in primitive_fields[name].items():
+            err = np.abs(values - ref_prim[key])
+            save_error_map(
+                os.path.join(outdir, f"error_{key}_{name}_{tag}.pdf"),
+                err,
+                key=key,
             )
 
 
@@ -315,6 +486,8 @@ def run_rollout_eval(
     models: dict[str, tuple[torch.nn.Module, dict]],
     test_states: torch.Tensor,
     dt: float,
+    gamma: float,
+    selected_idx: np.ndarray,
     device: torch.device,
     *,
     pin_memory: bool,
@@ -335,6 +508,11 @@ def run_rollout_eval(
             f"({n_snaps_keep} snapshots, final t={(n_snaps_keep - 1) * dt:g})"
         )
 
+    max_rollout_steps = int(test_states.shape[1] - 1)
+    rollout_steps = max_rollout_steps if args.rollout_steps <= 0 else min(int(args.rollout_steps), max_rollout_steps)
+    test_states = test_states[:, : rollout_steps + 1]
+    print(f"[rollout] steps={rollout_steps}/{max_rollout_steps}")
+
     n_eval = int(test_states.shape[0])
     times = np.arange(int(test_states.shape[1]), dtype=np.float64) * dt
     rollout_scores: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -345,11 +523,11 @@ def run_rollout_eval(
         l1 = np.zeros((n_eval, len(times)), dtype=np.float64)
         linf = np.zeros((n_eval, len(times)), dtype=np.float64)
         for idx in range(n_eval):
-            ref = test_states[idx].cpu().numpy()
+            ref = test_states[idx, : rollout_steps + 1].cpu().numpy()
             pred = rollout_step_model(
                 model,
                 test_states[idx, 0],
-                n_steps=int(test_states.shape[1] - 1),
+                n_steps=rollout_steps,
                 dt=dt,
                 device=device,
                 dtype=torch.float32,
@@ -413,54 +591,85 @@ def run_rollout_eval(
     plt.close(fig)
 
     if args.plot_one and one_ref is not None and one_preds is not None:
-        save_density_plots(args.outdir, times, one_ref, one_preds, args.plot_channel, args.yslices)
+        plot_tag = f"{sample_tag(int(selected_idx[0]), args.sample_seed)}_steps{rollout_steps}"
+        plot_models = {k: v for k, v in one_preds.items() if k in ("hybrid", "fno")}
+        save_density_plots(
+            args.outdir,
+            one_ref,
+            plot_models,
+            final_time=float(times[-1]),
+            gamma=gamma,
+            tag=plot_tag,
+            share_ref_colorbar=args.share_ref_colorbar,
+        )
 
 
 def run_test_eval(
     args: argparse.Namespace,
-    models: dict[str, tuple[torch.nn.Module, dict]],
     test_states: torch.Tensor,
     dt: float,
     device: torch.device,
     *,
     pin_memory: bool,
 ) -> None:
+    u0_test, u1_test = states_to_one_step_pairs(test_states, dtype=torch.float32)
+    print(f"[test] one-step pairs={int(u0_test.shape[0])}")
     test_rows = []
-    target = None
-    for name, (model, _) in models.items():
-        pred, maybe_target = evaluate_test_dataset(
-            model,
-            test_states,
-            dt,
-            device,
-            batch_size=args.test_batch,
-            pin_memory=pin_memory,
+    for name, model, ckpt, path in iter_test_models(args, device):
+        print(
+            f"[test] evaluating {name}, params={count_params(model):,}, "
+            f"path={path}, bc={ckpt.get('bc', ckpt.get('args', {}).get('bc', '?'))}"
         )
-        if target is None:
-            target = maybe_target
-        test_rows.append(dataset_error_row(name, pred, target))
+        test_rows.append(
+            evaluate_pairs_streaming(
+                name,
+                model,
+                u0_test,
+                u1_test,
+                dt,
+                device,
+                dtype=torch.float32,
+                batch_size=args.test_batch,
+                pin_memory=pin_memory,
+                progress_every=100,
+            )
+        )
+        del model
+        release_eval_memory(device)
     test_csv_path = save_test_metrics_csv(args.outdir, test_rows)
-    print(f"[test] saved csv: {test_csv_path}")
+    test_summary_csv_path = save_test_metrics_summary_csv(args.outdir, test_rows)
+    print(f"[test] saved csv: {test_csv_path}, {test_summary_csv_path}")
 
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, default=DEFAULT_HYBRID_CKPT)
     ap.add_argument("--ckpt_fno", type=str, default=DEFAULT_FNO_CKPT)
-    ap.add_argument("--ckpt_cnn", type=str, default=DEFAULT_CNN_CKPT)
     ap.add_argument("--hybrid_only", action="store_true", help="Evaluate only the primary --ckpt model.")
     ap.add_argument("--eval_mode", type=str, default="both", choices=("rollout", "test", "both"))
     ap.add_argument("--data_dir", type=str, default="dataset")
     ap.add_argument("--test_name", type=str, default=DEFAULT_TEST_NAME)
     ap.add_argument("--test_path", type=str, default=None)
-    ap.add_argument("--test_batch", type=int, default=32)
+    ap.add_argument("--test_batch", type=int, default=8)
     ap.add_argument("--n_samples", type=int, default=0, help="0 means use all test trajectories for rollout.")
+    ap.add_argument("--sample_seed", type=int, default=None, help="Random seed used to choose evaluation trajectories.")
     ap.add_argument("--T", type=float, default=None, help="Optional rollout horizon; truncate test trajectories to t<=T.")
+    ap.add_argument(
+        "--rollout_steps",
+        type=int,
+        default=0,
+        help="Number of rollout steps to evaluate. 0 means use the full available trajectory after any --T truncation.",
+    )
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--allow_tf32", action="store_true")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument("--outdir", type=str, default="eval_euler2d_periodic_dt_out")
     ap.add_argument("--plot_one", action="store_true")
+    ap.add_argument(
+        "--share_ref_colorbar",
+        action="store_true",
+        help="Use union(ref, hybrid) vmin/vmax for ref+hybrid conserved & primitive plots; fno uses per-field auto scale.",
+    )
     ap.add_argument("--plot_channel", type=int, default=0, help="Conserved channel to visualize, 0=rho.")
     ap.add_argument("--yslices", type=float, nargs="+", default=[0.5], help="y-slices for x-t plots in [0, 1].")
     return ap
@@ -473,70 +682,85 @@ def main() -> None:
     device = torch.device(args.device)
     configure_runtime(device, allow_tf32=args.allow_tf32)
     pin_mem = device.type == "cuda"
+    run_rollout = args.eval_mode in ("rollout", "both")
+    run_test = args.eval_mode in ("test", "both")
 
-    primary_model, primary_ckpt, primary_path = load_model_from_ckpt(
-        args.ckpt,
-        device,
-        no_compile=args.no_compile,
-    )
-    models: dict[str, tuple[torch.nn.Module, dict]] = {
-        model_label_from_ckpt(primary_ckpt): (primary_model, primary_ckpt)
-    }
-    model_paths = {model_label_from_ckpt(primary_ckpt): primary_path}
-    model_param_counts = {model_label_from_ckpt(primary_ckpt): count_params(primary_model)}
+    models: dict[str, tuple[torch.nn.Module, dict]] = {}
+    model_paths: dict[str, str] = {}
+    model_param_counts: dict[str, int] = {}
 
-    if not args.hybrid_only:
-        model_fno, ckpt_fno, path_fno = load_optional_model(
-            args.ckpt_fno,
+    if run_rollout:
+        primary_model, primary_ckpt, primary_path = load_model_from_ckpt(
+            args.ckpt,
             device,
             no_compile=args.no_compile,
-            default_path=DEFAULT_FNO_CKPT,
         )
-        if model_fno is not None and ckpt_fno is not None and path_fno is not None:
-            name_fno = model_label_from_ckpt(ckpt_fno)
-            models[name_fno] = (model_fno, ckpt_fno)
-            model_paths[name_fno] = path_fno
-            model_param_counts[name_fno] = count_params(model_fno)
+        primary_name = model_label_from_ckpt(primary_ckpt)
+        models[primary_name] = (primary_model, primary_ckpt)
+        model_paths[primary_name] = primary_path
+        model_param_counts[primary_name] = count_params(primary_model)
 
-        model_cnn, ckpt_cnn, path_cnn = load_optional_model(
-            args.ckpt_cnn,
-            device,
-            no_compile=args.no_compile,
-            default_path=DEFAULT_CNN_CKPT,
-        )
-        if model_cnn is not None and ckpt_cnn is not None and path_cnn is not None:
-            name_cnn = model_label_from_ckpt(ckpt_cnn)
-            models[name_cnn] = (model_cnn, ckpt_cnn)
-            model_paths[name_cnn] = path_cnn
-            model_param_counts[name_cnn] = count_params(model_cnn)
+        if not args.hybrid_only:
+            model_fno, ckpt_fno, path_fno = load_optional_model(
+                args.ckpt_fno,
+                device,
+                no_compile=args.no_compile,
+                default_path=DEFAULT_FNO_CKPT,
+            )
+            if model_fno is not None and ckpt_fno is not None and path_fno is not None:
+                name_fno = model_label_from_ckpt(ckpt_fno)
+                models[name_fno] = (model_fno, ckpt_fno)
+                model_paths[name_fno] = path_fno
+                model_param_counts[name_fno] = count_params(model_fno)
 
     print(f"[params] hybrid={model_param_counts.get('hybrid', 'unavailable'):,}" if "hybrid" in model_param_counts else "[params] hybrid=unavailable")
     print(f"[params] fno={model_param_counts.get('fno', 'unavailable'):,}" if "fno" in model_param_counts else "[params] fno=unavailable")
-    if "cnn" in model_param_counts:
-        print(f"[params] cnn={model_param_counts['cnn']:,}")
 
     test_path = resolve_test_split_path(args)
     test_states, test_meta = load_trajectory_split(test_path)
     dt = float(test_meta["dt"])
-    test_states = select_trajectories(test_states, args.n_samples if args.n_samples > 0 else None)
+    gamma = float(test_meta.get("gamma", 1.4))
+    total_traj = int(test_states.shape[0])
+    selected_idx = select_trajectory_indices(
+        total_traj,
+        args.n_samples if args.n_samples > 0 else None,
+        args.sample_seed,
+    )
+    test_states = test_states[torch.as_tensor(selected_idx, dtype=torch.long)]
     print(
-        f"[data] test_path={test_path}, n_traj={int(test_states.shape[0])}, "
+        f"[data] test_path={test_path}, n_traj={int(test_states.shape[0])}/{total_traj}, "
         f"n_snaps={int(test_states.shape[1])}, dt={dt}, "
-        f"nx={int(test_meta['nx'])}, ny={int(test_meta['ny'])}, boundary={test_meta.get('boundary', '?')}"
+        f"nx={int(test_meta['nx'])}, ny={int(test_meta['ny'])}, boundary={test_meta.get('boundary', '?')}, "
+        f"sample_seed={args.sample_seed}"
     )
     print(
         "[models] "
-        + ", ".join(
-            f"{name}={model_paths[name]} (bc={models[name][1].get('bc', models[name][1].get('args', {}).get('bc', '?'))})"
-            for name in sorted(models.keys())
+        + (
+            ", ".join(
+                f"{name}={model_paths[name]} (bc={models[name][1].get('bc', models[name][1].get('args', {}).get('bc', '?'))})"
+                for name in sorted(models.keys())
+            )
+            if run_rollout
+            else "test mode loads models sequentially"
         )
     )
+    if args.plot_one and selected_idx.size > 0:
+        print(f"[plot_one] selected trajectory index={int(selected_idx[0])}")
 
-    if args.eval_mode in ("rollout", "both"):
-        run_rollout_eval(args, models, test_states, dt, device, pin_memory=pin_mem)
+    if run_rollout:
+        run_rollout_eval(args, models, test_states, dt, gamma, selected_idx, device, pin_memory=pin_mem)
 
-    if args.eval_mode in ("test", "both"):
-        run_test_eval(args, models, test_states, dt, device, pin_memory=pin_mem)
+    if run_test:
+        if run_rollout:
+            models.clear()
+            primary_model = None
+            primary_ckpt = None
+            primary_path = None
+            model_fno = None
+            ckpt_fno = None
+            path_fno = None
+            release_eval_memory(device)
+        run_test_eval(args, test_states, dt, device, pin_memory=pin_mem)
 
     print(f"Saved outputs to: {args.outdir}")
 

@@ -35,7 +35,7 @@ from dataset.data import build_burgers2d_solver, make_periodic_grid, random_four
 torch.set_default_dtype(torch.float64)
 
 DEFAULT_HYBRID_CKPT = "checkpoints/burgers2d_hybrid_dt.pt"
-DEFAULT_FNO_CKPT = "checkpoints/burgers2d_fno_dt_16.pt"
+DEFAULT_FNO_CKPT = "checkpoints/burgers2d_fno_dt_24.pt"
 DEFAULT_CNN_CKPT = "checkpoints/burgers2d_cnn_dt.pt"
 LINE_GRID_ALPHA = 0.3
 

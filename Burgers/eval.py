@@ -20,14 +20,14 @@ _SRC = os.path.join(_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from conslaw.checkpoints import compile_if_requested, load_hybrid_fixedstep_map_1d
+from conslaw.checkpoints import compile_if_requested, load_hybrid_step_map_1d
 from conslaw.eval_reports import dataset_error_row, save_rollout_reports, save_test_metrics_csv
 from conslaw.models import count_params
 from conslaw.solver import FD_WENOZ
 
 torch.set_default_dtype(torch.float64)
 
-DEFAULT_FNO_CKPT = "checkpoints/burgers_fno_flux_fixedstep.pt"
+DEFAULT_FNO_CKPT = "checkpoints/burgers_fno_flowmap_dt_24.pt"
 LINE_GRID_ALPHA = 0.3
 
 
@@ -233,7 +233,7 @@ def save_scalar_rollout_visuals(
 
 
 @torch.no_grad()
-def rollout_hybrid_scalar(step_model, u0_low, n_steps, device, pin_memory: bool):
+def rollout_hybrid_scalar(step_model, u0_low, n_steps, device, pin_memory: bool, dt_model: float | None = None):
     if hasattr(step_model, "eval") and callable(step_model.eval):
         step_model.eval()
     u = torch.from_numpy(u0_low).view(1, -1, 1)
@@ -244,13 +244,19 @@ def rollout_hybrid_scalar(step_model, u0_low, n_steps, device, pin_memory: bool)
     for _ in range(n_steps):
         if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
             torch.compiler.cudagraph_mark_step_begin()
-        u = step_model(u).clone()
+        if dt_model is not None:
+            dt_b = torch.full((1,), dt_model, device=u.device, dtype=u.dtype)
+            u = step_model(u, dt_b).clone()
+        else:
+            u = step_model(u).clone()
         traj.append(u.squeeze(0).squeeze(-1).cpu().numpy())
     return np.stack(traj, axis=0)
 
 
 @torch.no_grad()
-def evaluate_test_dataset_scalar(step_model, test_pt_path, device, pin_memory: bool, batch_size: int):
+def evaluate_test_dataset_scalar(
+    step_model, test_pt_path, device, pin_memory: bool, batch_size: int, dt_model: float | None = None
+):
     data = torch.load(test_pt_path, map_location="cpu")
     u0_all = data["input"].unsqueeze(-1).to(torch.float64)
     u1_all = data["output"].unsqueeze(-1).to(torch.float64)
@@ -263,25 +269,35 @@ def evaluate_test_dataset_scalar(step_model, test_pt_path, device, pin_memory: b
         u0 = u0.to(device=device, dtype=torch.float64, non_blocking=pin_memory and device.type == "cuda")
         if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
             torch.compiler.cudagraph_mark_step_begin()
-        preds.append(step_model(u0).cpu().numpy())
+        if dt_model is not None:
+            dt_b = torch.full((u0.size(0),), dt_model, device=u0.device, dtype=u0.dtype)
+            preds.append(step_model(u0, dt_b).cpu().numpy())
+        else:
+            preds.append(step_model(u0).cpu().numpy())
     return np.concatenate(preds, axis=0), u1_all.numpy()
 
 
 def load_optional_fno(ckpt_fno: str, device: torch.device, no_compile: bool, default_path: str):
     if not ckpt_fno:
-        return None
+        return None, None
     if not os.path.isfile(ckpt_fno):
         if ckpt_fno == default_path:
             print(f"[eval] FNO checkpoint not found, skipping baseline: {ckpt_fno}")
-            return None
+            return None, None
         raise FileNotFoundError(f"FNO checkpoint not found: {ckpt_fno}")
-    model_fno, _ = load_hybrid_fixedstep_map_1d(ckpt_fno, device=device)
-    return compile_if_requested(model_fno, device, no_compile=no_compile)
+    model_fno, ckpt_f = load_hybrid_step_map_1d(ckpt_fno, device=device)
+    model_fno = compile_if_requested(model_fno, device, no_compile=no_compile)
+    dt_fno = float(ckpt_f["dt"]) if str(ckpt_f.get("integrator", "")) == "u_plus_dt_rhs" else None
+    print(
+        f"[ckpt_fno] kind={ckpt_f.get('kind', '')}, integrator={ckpt_f.get('integrator', '')}"
+        + (f", dt={dt_fno}" if dt_fno is not None else "")
+    )
+    return model_fno, dt_fno
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", type=str, default="checkpoints/burgers_hybrid_fixedstep.pt")
+    ap.add_argument("--ckpt", type=str, default="checkpoints/burgers_hybrid_flowmap_dt.pt")
     ap.add_argument(
         "--ckpt_fno",
         type=str,
@@ -318,9 +334,14 @@ def main():
     if not os.path.isfile(args.ckpt):
         raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
 
-    model, ckpt = load_hybrid_fixedstep_map_1d(args.ckpt, device=device)
+    model, ckpt = load_hybrid_step_map_1d(args.ckpt, device=device)
     model = compile_if_requested(model, device, no_compile=args.no_compile)
-    model_fno = load_optional_fno(args.ckpt_fno, device, args.no_compile, DEFAULT_FNO_CKPT)
+    dt_model = float(ckpt["dt"]) if str(ckpt.get("integrator", "")) == "u_plus_dt_rhs" else None
+    print(
+        f"[ckpt] kind={ckpt.get('kind', '')}, integrator={ckpt.get('integrator', '')}"
+        + (f", dt_model={dt_model}" if dt_model is not None else "")
+    )
+    model_fno, dt_fno = load_optional_fno(args.ckpt_fno, device, args.no_compile, DEFAULT_FNO_CKPT)
     print(f"[params] hybrid={count_params(model):,}")
     if model_fno is not None:
         print(f"[params] fno={count_params(model_fno):,}")
@@ -394,9 +415,9 @@ def main():
             ref_low = np.stack([block_average(snaps_hi[j], args.upsample) for j in range(nT)], axis=0)
 
             u0_low = ref_low[0]
-            pred = rollout_hybrid_scalar(model, u0_low, n_steps, device, pin_mem)
+            pred = rollout_hybrid_scalar(model, u0_low, n_steps, device, pin_mem, dt_model=dt_model)
             pred_fno = (
-                rollout_hybrid_scalar(model_fno, u0_low, n_steps, device, pin_mem)
+                rollout_hybrid_scalar(model_fno, u0_low, n_steps, device, pin_mem, dt_model=dt_fno)
                 if model_fno is not None
                 else None
             )
@@ -455,10 +476,14 @@ def main():
         test_path = args.test_path or os.path.join(args.data_dir, "test_pv.pt")
         if not os.path.isfile(test_path):
             raise FileNotFoundError(f"Test dataset not found: {test_path}")
-        pred_h, target = evaluate_test_dataset_scalar(model, test_path, device, pin_mem, args.test_batch)
+        pred_h, target = evaluate_test_dataset_scalar(
+            model, test_path, device, pin_mem, args.test_batch, dt_model=dt_model
+        )
         test_rows = [dataset_error_row("hybrid", pred_h, target)]
         if model_fno is not None:
-            pred_f, _ = evaluate_test_dataset_scalar(model_fno, test_path, device, pin_mem, args.test_batch)
+            pred_f, _ = evaluate_test_dataset_scalar(
+                model_fno, test_path, device, pin_mem, args.test_batch, dt_model=dt_fno
+            )
             test_rows.append(dataset_error_row("fno", pred_f, target))
         test_csv_path = save_test_metrics_csv(args.outdir, test_rows)
         print(f"[test] saved csv: {test_csv_path}")

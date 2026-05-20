@@ -1263,13 +1263,138 @@ def explicit_euler_dt_step(u: torch.Tensor, dt: torch.Tensor, rhs: torch.Tensor)
     return u + _broadcast_dt(dt, u) * rhs
 
 
+class PeriodicRhs1d(nn.Module):
+    """1D periodic: optional zero-mean of ``tilde_rhs`` per batch/channel (cf. :class:`PeriodicRhs2d`)."""
+
+    def forward(
+        self,
+        tilde_rhs: torch.Tensor,
+        *,
+        h: torch.Tensor | None = None,
+        n_cells: int | None = None,
+        u_ref: torch.Tensor | None = None,
+        zero_mean_rhs: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        del h, n_cells, u_ref
+        rhs = zero_mean_q(tilde_rhs) if zero_mean_rhs else tilde_rhs
+        return {"rhs": rhs}
+
+
+class IdentityRhs1d(nn.Module):
+    """Pass through ``tilde_rhs`` (optional no-op; same role as :class:`IdentityRhs2d`)."""
+
+    def forward(
+        self,
+        tilde_rhs: torch.Tensor,
+        *,
+        h: torch.Tensor | None = None,
+        n_cells: int | None = None,
+        u_ref: torch.Tensor | None = None,
+        zero_mean_rhs: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        del h, n_cells, u_ref, zero_mean_rhs
+        return {"rhs": tilde_rhs}
+
+
+class HybridDtStep1d(nn.Module):
+    """
+    Same pattern as :class:`HybridDtStep2d`: :class:`HybridBackbone1d` produces a raw field
+    (``tilde_q`` tensor, interpreted as ``tilde_rhs``), :class:`PeriodicRhs1d` or
+    :class:`OutflowAffineLearnedQ1d` projects to ``rhs``, then explicit Euler ``u + dt * rhs``.
+
+    The backbone head is shared with the flux path; only the one-step map and training target
+    differ (see trainers: ``u^{n+1} ≈ u^n + dt * rhs`` vs ``u^{n+1} ≈ u^n - q``).
+    """
+
+    def __init__(
+        self,
+        width: int = 64,
+        n_layers: int = 4,
+        modes: int = 16,
+        mr_kernel: int = 5,
+        n_cons: int = 1,
+        bc: str = "periodic",
+        dx: float = 1.0,
+        spectral_pad: int = 4,
+        *,
+        zero_mean_rhs: bool = True,
+        project_outflow_rhs: bool = True,
+        backbone: HybridBackbone1d | None = None,
+        rhs_projector: nn.Module | None = None,
+    ):
+        super().__init__()
+        if bc not in ("periodic", "outflow"):
+            raise ValueError("bc must be 'periodic' or 'outflow'")
+        self.n_cons = n_cons
+        self.bc = bc
+        self.zero_mean_rhs = bool(zero_mean_rhs)
+        self.project_outflow_rhs = bool(project_outflow_rhs)
+        if backbone is not None:
+            self.backbone = backbone
+        else:
+            self.backbone = HybridBackbone1d(
+                width=width,
+                n_layers=n_layers,
+                modes=modes,
+                mr_kernel=mr_kernel,
+                n_cons=n_cons,
+                bc=bc,
+                spectral_pad=spectral_pad,
+            )
+        if rhs_projector is not None:
+            self.rhs_projector = rhs_projector
+        elif bc == "periodic":
+            self.rhs_projector = PeriodicRhs1d()
+        elif not self.project_outflow_rhs:
+            self.rhs_projector = IdentityRhs1d()
+        else:
+            self.rhs_projector = OutflowAffineLearnedQ1d(n_cons=n_cons, width=width, dx=dx)
+        if isinstance(self.backbone, HybridBackbone1d):
+            self.width = self.backbone.width
+            self.n_layers = self.backbone.n_layers
+        else:
+            self.width = width
+            self.n_layers = n_layers
+
+    def evolve(self, u: torch.Tensor, dt: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        return u + _broadcast_dt_1d(dt, u) * rhs
+
+    def forward(self, u: torch.Tensor, dt: torch.Tensor, return_aux: bool = False):
+        if u.dim() != 3 or u.size(-1) != self.n_cons:
+            raise ValueError(f"Expected u (B, N, {self.n_cons}), got {tuple(u.shape)}")
+        n_cells = u.size(1)
+        out = self.backbone(u)
+        tilde_rhs = out["tilde_q"]
+        h = out["h"]
+        if isinstance(self.rhs_projector, OutflowAffineLearnedQ1d):
+            proj = self.rhs_projector(tilde_rhs, h=h, n_cells=n_cells, u_ref=u)
+            rhs = proj["q"]
+        else:
+            proj = self.rhs_projector(
+                tilde_rhs,
+                h=h,
+                n_cells=n_cells,
+                u_ref=u,
+                zero_mean_rhs=self.zero_mean_rhs,
+            )
+            rhs = proj["rhs"]
+        u_next = self.evolve(u, dt, rhs)
+        if not return_aux:
+            return u_next
+        aux: Dict[str, torch.Tensor] = {"tilde_rhs": tilde_rhs, "rhs": rhs, "h": h}
+        for k in ("F_L", "F_R"):
+            if k in proj:
+                aux[k] = proj[k]
+        return u_next, aux
+
+
 class HybridDtStep2d(nn.Module):
     """
-    Default bundle: :class:`HybridBackbone2d` + :class:`PeriodicRhs2d` or
-    :class:`OutflowAffineLearnedRhs2d`, and explicit Euler ``u + dt * rhs``.
+    Default bundle: :class:`HybridBackbone2d` (or an injected :class:`HybridBackbone2dOutflow`)
+    + :class:`PeriodicRhs2d` or :class:`OutflowAffineLearnedRhs2d`, and explicit Euler ``u + dt * rhs``.
 
     Override :meth:`evolve` for RK / other integrators; replace ``rhs_projector`` or use
-    :class:`HybridBackbone2d` alone for full control.
+    a custom backbone alone for full control.
     """
 
     def __init__(
@@ -1288,7 +1413,7 @@ class HybridDtStep2d(nn.Module):
         *,
         zero_mean_rhs: bool = True,
         project_outflow_rhs: bool = True,
-        backbone: HybridBackbone2d | None = None,
+        backbone: HybridBackbone2d | HybridBackbone2dOutflow | None = None,
         rhs_projector: nn.Module | None = None,
     ):
         super().__init__()
@@ -1323,7 +1448,7 @@ class HybridDtStep2d(nn.Module):
             self.rhs_projector = OutflowAffineLearnedRhs2d(
                 out_channels=out_channels, width=width, dx=dx, dy=dy
             )
-        if isinstance(self.backbone, HybridBackbone2d):
+        if isinstance(self.backbone, (HybridBackbone2d, HybridBackbone2dOutflow)):
             self.width = self.backbone.width
             self.n_layers = self.backbone.n_layers
         else:
@@ -1526,8 +1651,11 @@ __all__ = [
     "FNODtStep2d",
     "HybridBackbone1d",
     "HybridBackbone2d",
+    "HybridDtStep1d",
     "HybridDtStep2d",
     "HybridFixedStepMap1d",
+    "IdentityRhs1d",
+    "PeriodicRhs1d",
     "maybe_torch_compile",
     "OutflowAffineLearnedQ1d",
     "OutflowAffineLearnedRhs2d",
