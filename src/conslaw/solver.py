@@ -38,6 +38,7 @@ def get_numba_thread_count():
         return None
     return _numba_get_num_threads()
 
+# Default dtype for the solver
 SOLVER_DTYPE = np.float64
 
 
@@ -136,6 +137,10 @@ if NUMBA_AVAILABLE:
                 a4 = amax
                 a5 = amax
             else:
+                # Match scalar FD_WENOZ ``_numerical_flux_all_interfaces``: ``_split_flux(u_ext)``
+                # uses cellwise alpha on the padded line (not the single ``a_int`` per interface
+                # from ``_numerical_flux_all_interfaces_internal``, which is used for characteristic
+                # systems).
                 a0 = abs(u_ext[m + 0])
                 a1 = abs(u_ext[m + 1])
                 a2 = abs(u_ext[m + 2])
@@ -234,11 +239,16 @@ if NUMBA_AVAILABLE:
         return traj
 
 
+# =============================================================================
+# Cell-average downsample (conservation law)
+# =============================================================================
 def downsample_cell_average(u, factor):
     """
     Conservative downsampling by cell average.
+
     u: (..., N) with N divisible by factor.
     Returns: (..., N // factor), each value = mean of `factor` consecutive cells.
+
     Works for NumPy arrays (and Torch via WENO5.downsample).
     """
     if u.shape[-1] % factor != 0:
@@ -252,6 +262,7 @@ def downsample_cell_average(u, factor):
 def downsample_cell_average2d(u, factor_y, factor_x=None):
     """
     Conservative 2D block-average downsampling on the last two axes.
+
     u: (..., Ny, Nx)
     Returns: (..., Ny // factor_y, Nx // factor_x)
     """
@@ -276,7 +287,7 @@ class FD_WENOZ:
         dflux=None,
         alpha=None,
         char_decomp=None,
-        char_decomp_batch=None,
+        char_decomp_batch=None,   # 新增
         n_comp=1,
         flux_split="local_lf",
         eps=1e-40,
@@ -351,6 +362,7 @@ class FD_WENOZ:
     def _flux_array(self, u):
         """
         Flux evaluated on an array of states.
+
         For scalar problems u may be shape (N,) or (..., N).
         For systems with n_comp > 1, u is typically (n_comp, N).
         """
@@ -359,6 +371,7 @@ class FD_WENOZ:
     def _alpha_vector(self, u):
         """
         Wave-speed bound on the last axis.
+
         Returns shape (N,) for system states (n_comp, N), or a shape
         broadcastable to u for scalar problems.
         """
@@ -373,6 +386,7 @@ class FD_WENOZ:
     def _reflect_sign_array(self, u):
         """
         Return reflect_sign in a dtype/shape usable for broadcasting.
+
         Typical uses:
           scalar: reflect_sign = +/-1
           Euler with u shape (3, N): reflect_sign = np.array([1,-1,1])[:, None]
@@ -407,6 +421,7 @@ class FD_WENOZ:
                 constant_values=0.0,
             )
 
+        # True reflection via mirrored ghost cells
         s = self._reflect_sign_array(u)
         left = s * np.flip(u[..., :ng], axis=-1)
         right = s * np.flip(u[..., -ng:], axis=-1)
@@ -415,6 +430,7 @@ class FD_WENOZ:
     def _weno5_left_from_ext(self, v_ext, N):
         """
         Left-biased WENO-Z reconstruction at ALL interfaces.
+
         v_ext has shape (..., N + 6) because ng = 3.
         Returns shape (..., N+1), where output[..., m] approximates v^- at interface m
         (m = 0,...,N corresponding to x_{-1/2}, x_{1/2}, ..., x_{N-1/2}).
@@ -455,6 +471,7 @@ class FD_WENOZ:
     def _weno5_right_from_ext(self, v_ext, N):
         """
         Right-biased WENO-Z reconstruction at ALL interfaces.
+
         Returns shape (..., N+1), where output[..., m] approximates v^+ at interface m.
         """
         # For interface m, use cells m-2, m-1, m, m+1, m+2

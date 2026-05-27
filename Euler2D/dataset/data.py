@@ -19,7 +19,7 @@ eigendecomposition for left/right matrices passed to ``FD_WENOZ``).
 this module therefore applies the 1D solver **line-by-line** in x and y (same splitting
 idea as ``FD_WENOZ2D`` for scalars).
 
-Boundary conditions follow ``clop.solver.FD_WENOZ`` / ``FD_WENOZ2D`` (e.g. ``outflow`` =
+Boundary conditions follow ``conslaw.solver.FD_WENOZ`` / ``FD_WENOZ2D`` (e.g. ``outflow`` =
 edge extrapolation of ghosts).
 
 Dataset generation (``build_euler2d_quadrant_split`` / ``python -m Euler2D.dataset.data``):
@@ -46,7 +46,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-from clop.solver import FD_WENOZ, SOLVER_DTYPE, downsample_cell_average2d
+from conslaw.solver import FD_WENOZ, SOLVER_DTYPE, downsample_cell_average2d
 
 # -----------------------------------------------------------------------------
 # Config
