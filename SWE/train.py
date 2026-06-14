@@ -246,7 +246,7 @@ def main():
         action="store_true",
         help="[integrator=dt, outflow] use OutflowAffineLearnedQ1d on tilde_rhs.",
     )
-    ap.add_argument("--save", type=str, default="")
+    ap.add_argument("--save", type=str, default="checkpoints/swe_hybrid_flowmap_dt.pt")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument(

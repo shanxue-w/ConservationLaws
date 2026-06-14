@@ -217,7 +217,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--width", type=int, default=64)
     ap.add_argument("--n_layers", type=int, default=4)
-    ap.add_argument("--modes", type=int, default=32, help="FNO Fourier modes")
+    ap.add_argument("--modes", type=int, default=24, help="FNO Fourier modes")
     ap.add_argument("--mr_kernel", type=int, default=5, help="unused; CLI parity with train.py")
     ap.add_argument(
         "--bc",
@@ -234,7 +234,7 @@ def main():
     ap.add_argument(
         "--integrator",
         type=str,
-        default="flux",
+        default="dt",
         choices=("flux", "dt"),
         help="flux: FNO flux + u-q; dt: FNODtStep1d (n_cons=2).",
     )
@@ -243,7 +243,7 @@ def main():
         action="store_true",
         help="[integrator=dt, periodic] disable mean removal on FNO output.",
     )
-    ap.add_argument("--save", type=str, default="")
+    ap.add_argument("--save", type=str, default="checkpoints/swe_fno_flowmap_dt_24.pt")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument(
