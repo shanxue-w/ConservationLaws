@@ -13,6 +13,8 @@ import matplotlib
 import numpy as np
 import torch
 
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join("/tmp", "numba_cache"))
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
@@ -85,8 +87,9 @@ def rel_linf(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
 def display_model_name(name: str) -> str:
     return {
         "ref": "Ref",
-        "hybrid": "Hybrid",
+        "hybrid": "LGNO",
         "fno": "FNO",
+        "weno256": "WENO256",
     }.get(str(name).lower(), str(name))
 
 
@@ -306,6 +309,10 @@ def error_math_label(key: str) -> str:
     return ERROR_MATH_LABELS.get(key, field_math_label(key))
 
 
+def field_limits(fields: dict[str, np.ndarray]) -> dict[str, tuple[float, float]]:
+    return {key: (float(np.min(values)), float(np.max(values))) for key, values in fields.items()}
+
+
 def merged_field_limits(a: dict[str, np.ndarray], b: dict[str, np.ndarray]) -> dict[str, tuple[float, float]]:
     keys = set(a) & set(b)
     out: dict[str, tuple[float, float]] = {}
@@ -314,6 +321,38 @@ def merged_field_limits(a: dict[str, np.ndarray], b: dict[str, np.ndarray]) -> d
         lo_b, hi_b = float(np.min(b[key])), float(np.max(b[key]))
         out[key] = (min(lo_a, lo_b), max(hi_a, hi_b))
     return out
+
+
+def build_euler2d_solver(**kwargs):
+    from dataset.data_periodic import build_euler2d_solver as _build_euler2d_solver
+
+    return _build_euler2d_solver(**kwargs)
+
+
+def rollout_weno256(
+    op,
+    u0: torch.Tensor | np.ndarray,
+    *,
+    dx: float,
+    dy: float,
+    dt: float,
+    n_steps: int,
+    cfl: float,
+    log_ic_state: bool = True,
+) -> np.ndarray:
+    if torch.is_tensor(u0):
+        u0_np = u0.detach().cpu().numpy()
+    else:
+        u0_np = np.asarray(u0)
+    return op.solve_snapshots(
+        np.asarray(u0_np, dtype=np.float64),
+        float(dx),
+        float(dy),
+        dt_snap=float(dt),
+        n_snaps=int(n_steps) + 1,
+        cfl=float(cfl),
+        log_ic_state=bool(log_ic_state),
+    )
 
 
 class _OneDecimalScalarFormatter(ScalarFormatter):
@@ -406,19 +445,11 @@ def save_density_plots(
 
     conserved_fields = {name: state_to_conserved_fields(state) for name, state in final_states.items()}
     primitive_fields = {name: conserved_to_primitive_2d(state, gamma=gamma) for name, state in final_states.items()}
-    conserved_shared_limits = (
-        merged_field_limits(conserved_fields["ref"], conserved_fields["hybrid"])
-        if share_ref_colorbar and "hybrid" in conserved_fields
-        else None
-    )
-    primitive_shared_limits = (
-        merged_field_limits(primitive_fields["ref"], primitive_fields["hybrid"])
-        if share_ref_colorbar and "hybrid" in primitive_fields
-        else None
-    )
+    conserved_shared_limits = field_limits(conserved_fields["ref"]) if share_ref_colorbar else None
+    primitive_shared_limits = field_limits(primitive_fields["ref"]) if share_ref_colorbar else None
 
     for name, fields in conserved_fields.items():
-        use_shared = bool(share_ref_colorbar and name in ("ref", "hybrid") and conserved_shared_limits is not None)
+        use_shared = bool(share_ref_colorbar and conserved_shared_limits is not None)
         panel_limits = conserved_shared_limits if use_shared else None
         out_path = os.path.join(outdir, f"conserved_{name}_{tag}.pdf")
         save_state_panel(
@@ -440,7 +471,7 @@ def save_density_plots(
             )
 
     for name, fields in primitive_fields.items():
-        use_shared = bool(share_ref_colorbar and name in ("ref", "hybrid") and primitive_shared_limits is not None)
+        use_shared = bool(share_ref_colorbar and primitive_shared_limits is not None)
         panel_limits = primitive_shared_limits if use_shared else None
         out_path = os.path.join(outdir, f"primitive_{name}_{tag}.pdf")
         save_state_panel(
@@ -487,6 +518,7 @@ def run_rollout_eval(
     test_states: torch.Tensor,
     dt: float,
     gamma: float,
+    meta: dict,
     selected_idx: np.ndarray,
     device: torch.device,
     *,
@@ -518,6 +550,51 @@ def run_rollout_eval(
     rollout_scores: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     one_ref = None
     one_preds = None
+
+    dx = float(meta["dx"])
+    dy = float(meta["dy"])
+    weno_cfl = float(meta.get("cfl", 0.4) if args.weno_cfl is None else args.weno_cfl)
+    weno_reconstruction = args.weno_reconstruction or str(meta.get("reconstruction", "component"))
+    weno_verbose = not bool(args.weno_quiet)
+    weno_op = build_euler2d_solver(
+        gamma=gamma,
+        bc=str(meta.get("boundary", "periodic")),
+        reconstruction=weno_reconstruction,
+        WENOtype="WENO-Z",
+        verbose=weno_verbose,
+        line_batch_size=int(args.weno_line_batch_size),
+    )
+    print(
+        f"[weno256] reconstruction={weno_reconstruction}, cfl={weno_cfl:g}, "
+        f"line_batch_size={args.weno_line_batch_size}, verbose={weno_verbose}"
+    )
+    l1 = np.zeros((n_eval, len(times)), dtype=np.float64)
+    linf = np.zeros((n_eval, len(times)), dtype=np.float64)
+    for idx in range(n_eval):
+        ref = test_states[idx, : rollout_steps + 1].cpu().numpy()
+        pred = rollout_weno256(
+            weno_op,
+            test_states[idx, 0],
+            dx=dx,
+            dy=dy,
+            dt=dt,
+            n_steps=rollout_steps,
+            cfl=weno_cfl,
+            log_ic_state=True,
+        )
+        for j in range(len(times)):
+            l1[idx, j] = rel_l1(pred[j], ref[j])
+            linf[idx, j] = rel_linf(pred[j], ref[j])
+        if args.plot_one and idx == 0:
+            one_ref = ref
+            if one_preds is None:
+                one_preds = {}
+            one_preds["weno256"] = pred
+    rollout_scores["weno256"] = (l1, linf)
+    print(
+        f"[rollout] weno256: final relL1={l1[:, -1].mean():.3e}, "
+        f"final relLinf={linf[:, -1].mean():.3e}"
+    )
 
     for name, (model, _) in models.items():
         l1 = np.zeros((n_eval, len(times)), dtype=np.float64)
@@ -592,7 +669,7 @@ def run_rollout_eval(
 
     if args.plot_one and one_ref is not None and one_preds is not None:
         plot_tag = f"{sample_tag(int(selected_idx[0]), args.sample_seed)}_steps{rollout_steps}"
-        plot_models = {k: v for k, v in one_preds.items() if k in ("hybrid", "fno")}
+        plot_models = {k: v for k, v in one_preds.items() if k in ("hybrid", "fno", "weno256")}
         save_density_plots(
             args.outdir,
             one_ref,
@@ -668,8 +745,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--share_ref_colorbar",
         action="store_true",
-        help="Use union(ref, hybrid) vmin/vmax for ref+hybrid conserved & primitive plots; fno uses per-field auto scale.",
+        help="Use the ref vmin/vmax per field for every conserved/primitive plot_one colormap.",
     )
+    ap.add_argument("--weno_cfl", type=float, default=None)
+    ap.add_argument("--weno_reconstruction", type=str, default=None, choices=("component", "characteristic"))
+    ap.add_argument("--weno_line_batch_size", type=int, default=16)
+    ap.add_argument("--weno_quiet", action="store_true", help="Disable WENO256 CFL substep printing.")
     ap.add_argument("--plot_channel", type=int, default=0, help="Conserved channel to visualize, 0=rho.")
     ap.add_argument("--yslices", type=float, nargs="+", default=[0.5], help="y-slices for x-t plots in [0, 1].")
     return ap
@@ -748,7 +829,7 @@ def main() -> None:
         print(f"[plot_one] selected trajectory index={int(selected_idx[0])}")
 
     if run_rollout:
-        run_rollout_eval(args, models, test_states, dt, gamma, selected_idx, device, pin_memory=pin_mem)
+        run_rollout_eval(args, models, test_states, dt, gamma, test_meta, selected_idx, device, pin_memory=pin_mem)
 
     if run_test:
         if run_rollout:

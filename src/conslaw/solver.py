@@ -287,7 +287,7 @@ class FD_WENOZ:
         dflux=None,
         alpha=None,
         char_decomp=None,
-        char_decomp_batch=None,   # 新增
+        char_decomp_batch=None,
         n_comp=1,
         flux_split="local_lf",
         eps=1e-40,

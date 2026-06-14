@@ -38,6 +38,8 @@ DEFAULT_HYBRID_CKPT = "checkpoints/burgers2d_hybrid_dt.pt"
 DEFAULT_FNO_CKPT = "checkpoints/burgers2d_fno_dt_24.pt"
 DEFAULT_CNN_CKPT = "checkpoints/burgers2d_cnn_dt.pt"
 LINE_GRID_ALPHA = 0.3
+SOLUTION_CMAP = "turbo"
+ERROR_CMAP = "turbo"
 
 
 def apply_line_grid(ax) -> None:
@@ -83,7 +85,7 @@ def resolve_optional_path(path: str, default_path: str) -> str:
 def display_model_name(name: str) -> str:
     return {
         "ref": "Ref",
-        "hybrid": "Hybrid",
+        "hybrid": "LGNO",
         "fno": "FNO",
         "cnn": "CNN",
     }.get(str(name).lower(), str(name))
@@ -383,7 +385,7 @@ def save_rollout_plots(
         save_field_pdf(
             u_ref,
             path=os.path.join(args.outdir, f"solution_ref_t{t_tag}_hybrid_dt2d{fig_seed}.pdf"),
-            cmap="viridis",
+            cmap=SOLUTION_CMAP,
         )
         for name in model_names:
             u_pred = pred_trajs[name][idx]
@@ -391,12 +393,12 @@ def save_rollout_plots(
             save_field_pdf(
                 u_pred,
                 path=os.path.join(args.outdir, f"solution_{name}_t{t_tag}_hybrid_dt2d{fig_seed}.pdf"),
-                cmap="viridis",
+                cmap=SOLUTION_CMAP,
             )
             save_field_pdf(
                 err,
                 path=os.path.join(args.outdir, f"error_{name}_t{t_tag}_hybrid_dt2d{fig_seed}.pdf"),
-                cmap="magma",
+                cmap=ERROR_CMAP,
                 vmin=0.0,
                 vmax=max(float(err.max()), 1e-12),
             )
@@ -448,7 +450,7 @@ def save_rollout_plots(
                 err_xt,
                 title="",
                 path=os.path.join(args.outdir, f"xt_error_{name}_y{y_tag}_hybrid_dt2d{fig_seed}.pdf"),
-                cmap="magma",
+                cmap=ERROR_CMAP,
                 vmin=0.0,
                 vmax=max(float(err_xt.max()), 1e-12),
             )

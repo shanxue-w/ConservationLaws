@@ -40,6 +40,7 @@ torch.set_default_dtype(torch.float64)
 
 DEFAULT_FNO_CKPT = "checkpoints/euler_fno_flowmap_dt_24.pt"
 LINE_GRID_ALPHA = 0.3
+XT_CMAP = "turbo"
 
 
 def apply_line_grid(ax) -> None:
@@ -91,10 +92,19 @@ def rel_linf(a, b, eps=1e-12):
 def display_model_name(name: str) -> str:
     return {
         "ref": "Ref",
-        "hybrid": "Hybrid",
+        "hybrid": "LGNO",
         "fno": "FNO",
         "cnn": "CNN",
     }.get(str(name).lower(), str(name))
+
+
+def add_ic_right_axis(ax, x: np.ndarray, values: np.ndarray):
+    ax_ic = ax.twinx()
+    (line,) = ax_ic.plot(x, values, label="IC", color="black", linestyle="--", lw=2)
+    ax_ic.set_ylabel("IC", fontsize=14, color="black")
+    ax_ic.tick_params(axis="y", colors="black")
+    ax_ic.grid(False)
+    return line
 
 
 def save_metric_curves_pdf(
@@ -118,7 +128,7 @@ def save_metric_curves_pdf(
     ax.set_yscale("log")
     ax.set_xlabel("t", fontsize=14)
     ax.set_ylabel(ylabel, fontsize=14)
-    ax.legend()
+    ax.legend(loc="best")
     apply_line_grid(ax)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, filename), bbox_inches="tight")
@@ -216,24 +226,37 @@ def save_euler_rollout_visuals(
         fig_err, axes_err = plt.subplots(len(keys), 1, figsize=(8, 3.2 * len(keys) + 0.2), sharex=True)
         axes_final = np.atleast_1d(axes_final)
         axes_err = np.atleast_1d(axes_err)
+        first_ic_line = None
 
         for idx, (key, label) in enumerate(labels.items()):
             ref_values = ref_family[key]
+            pred_values_by_name = {name: family[key] for name, family in pred_family.items()}
+            solution_xt_values = [ref_values, *pred_values_by_name.values()]
+            shared_xt_vmin = min(float(values.min()) for values in solution_xt_values)
+            shared_xt_vmax = max(float(values.max()) for values in solution_xt_values)
+            err_values_by_name = {
+                name: np.abs(pred_values - ref_values) for name, pred_values in pred_values_by_name.items()
+            }
+            shared_xt_error_vmax = max(
+                max(float(values.max()) for values in err_values_by_name.values()),
+                1e-12,
+            )
             save_xt_pdf(
                 x,
                 times,
                 ref_values,
                 title="",
                 path=os.path.join(outdir, f"xt_{file_tag}_{key}_ref{suffix}.pdf"),
-                cmap="viridis",
+                cmap=XT_CMAP,
+                vmin=shared_xt_vmin,
+                vmax=shared_xt_vmax,
             )
 
             ax_final = axes_final[idx]
             ax_err = axes_err[idx]
             ax_final.plot(x, ref_values[-1], label="Ref", lw=2)
-            for name, family in pred_family.items():
-                pred_values = family[key]
-                err_values = np.abs(pred_values - ref_values)
+            for name, pred_values in pred_values_by_name.items():
+                err_values = err_values_by_name[name]
                 ax_final.plot(x, pred_values[-1], label=display_model_name(name))
                 ax_err.plot(x, err_values[-1], label=f"{display_model_name(name)} error")
                 save_xt_pdf(
@@ -242,7 +265,9 @@ def save_euler_rollout_visuals(
                     pred_values,
                     title="",
                     path=os.path.join(outdir, f"xt_{file_tag}_{key}_{name}{suffix}.pdf"),
-                    cmap="viridis",
+                    cmap=XT_CMAP,
+                    vmin=shared_xt_vmin,
+                    vmax=shared_xt_vmax,
                 )
                 save_xt_pdf(
                     x,
@@ -250,22 +275,29 @@ def save_euler_rollout_visuals(
                     err_values,
                     title="",
                     path=os.path.join(outdir, f"xt_error_{file_tag}_{key}_{name}{suffix}.pdf"),
-                    cmap="magma",
+                    cmap=XT_CMAP,
                     vmin=0.0,
-                    vmax=max(float(err_values.max()), 1e-12),
+                    vmax=shared_xt_error_vmax,
                 )
+            ic_line = add_ic_right_axis(ax_final, x, ref_values[0])
+            if first_ic_line is None:
+                first_ic_line = ic_line
             ax_final.set_ylabel(label, fontsize=14)
             apply_line_grid(ax_final)
             ax_err.set_ylabel(f"|{label} err|", fontsize=14)
             apply_line_grid(ax_err)
 
-        axes_final[0].legend()
+        handles, legend_labels = axes_final[0].get_legend_handles_labels()
+        if first_ic_line is not None:
+            handles.append(first_ic_line)
+            legend_labels.append("IC")
+        axes_final[0].legend(handles, legend_labels, loc="best")
         axes_final[-1].set_xlabel("x", fontsize=14)
         fig_final.tight_layout(rect=[0, 0, 1, 0.96])
         fig_final.savefig(os.path.join(outdir, f"final_solution_{file_tag}{suffix}.pdf"), bbox_inches="tight")
         plt.close(fig_final)
 
-        axes_err[0].legend()
+        axes_err[0].legend(loc="best")
         axes_err[-1].set_xlabel("x", fontsize=14)
         fig_err.tight_layout(rect=[0, 0, 1, 0.96])
         fig_err.savefig(os.path.join(outdir, f"final_error_{file_tag}{suffix}.pdf"), bbox_inches="tight")

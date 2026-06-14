@@ -604,7 +604,7 @@ def main():
     ap.add_argument("--n_train", type=int, default=100)
     ap.add_argument("--n_val", type=int, default=20)
     ap.add_argument("--n_test", type=int, default=20)
-    ap.add_argument("--T", type=float, default=0.5)
+    ap.add_argument("--T", type=float, default=1.0)
     ap.add_argument("--dt_snap", type=float, default=5e-2)
     ap.add_argument("--nx_low", type=int, default=128)
     ap.add_argument("--ny_low", type=int, default=128)

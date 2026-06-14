@@ -200,11 +200,11 @@ def model_label_from_ckpt(ckpt: dict) -> str:
 def display_model_name(name: str) -> str:
     return {
         "ref": "Ref",
-        "hybrid": "Hybrid",
+        "hybrid": "LGNO",
         "fno": "FNO",
         "cnn": "CNN",
-        "weno256": "WENO-Z 256",
-        "weno512": "WENO-Z 512",
+        "weno256": "WENO256",
+        "weno512": "WENO512",
     }.get(str(name).lower(), str(name))
 
 
@@ -272,6 +272,10 @@ def primitive_fields(state_chw: np.ndarray) -> dict[str, np.ndarray]:
 def merged_field_limit(fields_by_model: dict[str, dict[str, np.ndarray]], key: str) -> tuple[float, float]:
     vals = [fields[key] for fields in fields_by_model.values() if key in fields]
     return min(float(np.min(v)) for v in vals), max(float(np.max(v)) for v in vals)
+
+
+def field_limits(fields: dict[str, np.ndarray]) -> dict[str, tuple[float, float]]:
+    return {key: (float(np.min(values)), float(np.max(values))) for key, values in fields.items()}
 
 
 class _OneDecimalScalarFormatter(ScalarFormatter):
@@ -457,6 +461,7 @@ def save_rollout_sample_plots(
     *,
     tag: str,
     shared_color_scale: bool = False,
+    share_ref_colorbar: bool = False,
 ) -> None:
     final_fields = {"ref": primitive_fields(ref_traj[-1])}
     for name, traj in pred_trajs.items():
@@ -464,9 +469,15 @@ def save_rollout_sample_plots(
 
     ref_fields = final_fields["ref"]
     pred_fields = {name: fields for name, fields in final_fields.items() if name != "ref"}
+    ref_color_limits = field_limits(ref_fields) if share_ref_colorbar else None
     for key in PRIMITIVE_CHANNELS:
         contour_limits = merged_field_limit(final_fields, key)
-        color_limits = contour_limits if shared_color_scale else None
+        if ref_color_limits is not None:
+            color_limits = ref_color_limits[key]
+        elif shared_color_scale:
+            color_limits = contour_limits
+        else:
+            color_limits = None
         error_vmax = None
         if shared_color_scale and pred_fields:
             error_vmax = max(
@@ -779,6 +790,35 @@ def primitive_traj_from_conserved(traj: np.ndarray, gamma: float = 1.4) -> np.nd
         [conserved_to_primitive_numpy(np.asarray(state, dtype=np.float64), gamma=gamma) for state in traj],
         axis=0,
     )
+
+
+def rollout_weno256_from_primitive(
+    op,
+    u0_prim: torch.Tensor | np.ndarray,
+    *,
+    dx: float,
+    dy: float,
+    dt: float,
+    n_steps: int,
+    cfl: float,
+    gamma: float,
+    log_ic_state: bool = True,
+) -> np.ndarray:
+    if torch.is_tensor(u0_prim):
+        u0_prim_np = u0_prim.detach().cpu().numpy()
+    else:
+        u0_prim_np = np.asarray(u0_prim)
+    u0_cons = primitive_to_conserved_numpy(np.asarray(u0_prim_np, dtype=np.float64), gamma=gamma)
+    cons_traj = op.solve_snapshots(
+        u0_cons,
+        float(dx),
+        float(dy),
+        dt_snap=float(dt),
+        n_snaps=int(n_steps) + 1,
+        cfl=float(cfl),
+        log_ic_state=bool(log_ic_state),
+    )
+    return primitive_traj_from_conserved(cons_traj, gamma=gamma)
 
 
 def downsample_conserved_traj(traj: np.ndarray, factor_y: int, factor_x: int | None = None) -> np.ndarray:
@@ -1113,7 +1153,14 @@ def run_demo_eval(
 
     if args.plot_one:
         tag = f"demo_{args.demo}_steps{rollout_steps}"
-        save_rollout_sample_plots(args.outdir, ref_traj, pred_trajs, tag=tag, shared_color_scale=args.shared_color_scale)
+        save_rollout_sample_plots(
+            args.outdir,
+            ref_traj,
+            pred_trajs,
+            tag=tag,
+            shared_color_scale=args.shared_color_scale,
+            share_ref_colorbar=args.share_ref_colorbar,
+        )
 
 
 def main() -> None:
@@ -1137,8 +1184,17 @@ def main() -> None:
     ap.add_argument(
         "--shared_color_scale",
         action="store_true",
-        help="Use one shared primitive-field color scale across Ref/Hybrid/FNO plot_one colormaps.",
+        help="Use one union primitive-field color scale across Ref/LGNO/FNO/WENO256 plot_one colormaps.",
     )
+    ap.add_argument(
+        "--share_ref_colorbar",
+        action="store_true",
+        help="Use the ref vmin/vmax per primitive field for every plot_one colormap.",
+    )
+    ap.add_argument("--weno_cfl", type=float, default=None)
+    ap.add_argument("--weno_reconstruction", type=str, default=None, choices=("component", "characteristic"))
+    ap.add_argument("--weno_line_batch_size", type=int, default=16)
+    ap.add_argument("--weno_quiet", action="store_true", help="Disable normal-rollout WENO256 CFL substep printing.")
     ap.add_argument("--demo", type=str, default=None, choices=sorted(DEMO_CONFIGS))
     ap.add_argument("--demo_nx", type=int, default=256)
     ap.add_argument("--demo_ny", type=int, default=256)
@@ -1216,6 +1272,48 @@ def main() -> None:
         one_ref = None
         one_preds = None
         print(f"[rollout-pri] steps={rollout_steps}/{max_rollout_steps}")
+        gamma = float(test_meta.get("gamma", 1.4))
+        dx = float(test_meta["dx"])
+        dy = float(test_meta["dy"])
+        weno_cfl = float(test_meta.get("cfl", 0.4) if args.weno_cfl is None else args.weno_cfl)
+        weno_reconstruction = args.weno_reconstruction or str(test_meta.get("reconstruction", "component"))
+        weno_verbose = not bool(args.weno_quiet)
+        weno_op = build_euler2d_solver(
+            gamma=gamma,
+            bc=str(test_meta.get("boundary", "outflow")),
+            reconstruction=weno_reconstruction,
+            WENOtype="WENO-Z",
+            verbose=weno_verbose,
+            line_batch_size=int(args.weno_line_batch_size),
+        )
+        print(
+            f"[weno256-pri] reconstruction={weno_reconstruction}, cfl={weno_cfl:g}, "
+            f"line_batch_size={args.weno_line_batch_size}, verbose={weno_verbose}"
+        )
+        l1 = np.zeros((n_eval, len(times)), dtype=np.float64)
+        linf = np.zeros((n_eval, len(times)), dtype=np.float64)
+        for idx in range(n_eval):
+            ref = test_states[idx, : rollout_steps + 1].cpu().numpy()
+            pred = rollout_weno256_from_primitive(
+                weno_op,
+                test_states[idx, 0],
+                dx=dx,
+                dy=dy,
+                dt=dt,
+                n_steps=rollout_steps,
+                cfl=weno_cfl,
+                gamma=gamma,
+                log_ic_state=True,
+            )
+            for j in range(len(times)):
+                l1[idx, j] = rel_l1(pred[j], ref[j])
+                linf[idx, j] = rel_linf(pred[j], ref[j])
+            if args.plot_one and idx == 0:
+                one_ref = ref
+                one_preds = {} if one_preds is None else one_preds
+                one_preds["weno256"] = pred
+        rollout_scores["weno256"] = (l1, linf)
+        print(f"[rollout-pri] weno256: final relL1={l1[:, -1].mean():.3e}, final relLinf={linf[:, -1].mean():.3e}")
         for name, (model, _) in models.items():
             model.eval()
             l1 = np.zeros((n_eval, len(times)), dtype=np.float64)
@@ -1287,7 +1385,14 @@ def main() -> None:
 
         if args.plot_one and one_ref is not None and one_preds is not None:
             tag = f"{sample_tag(int(selected_idx[0]), args.sample_seed)}_steps{rollout_steps}"
-            save_rollout_sample_plots(args.outdir, one_ref, one_preds, tag=tag, shared_color_scale=args.shared_color_scale)
+            save_rollout_sample_plots(
+                args.outdir,
+                one_ref,
+                one_preds,
+                tag=tag,
+                shared_color_scale=args.shared_color_scale,
+                share_ref_colorbar=args.share_ref_colorbar,
+            )
 
     if run_test:
         if run_rollout:

@@ -80,10 +80,19 @@ def rel_linf(a, b, eps=1e-12):
 def display_model_name(name: str) -> str:
     return {
         "ref": "Ref",
-        "hybrid": "Hybrid",
+        "hybrid": "LGNO",
         "fno": "FNO",
         "cnn": "CNN",
     }.get(str(name).lower(), str(name))
+
+
+def add_ic_right_axis(ax, x: np.ndarray, values: np.ndarray):
+    ax_ic = ax.twinx()
+    (line,) = ax_ic.plot(x, values, label="IC", color="black", linestyle="--", lw=2)
+    ax_ic.set_ylabel("IC", fontsize=14, color="black")
+    ax_ic.tick_params(axis="y", colors="black")
+    ax_ic.grid(False)
+    return line
 
 
 def save_metric_curves_pdf(
@@ -107,7 +116,7 @@ def save_metric_curves_pdf(
     ax.set_yscale("log")
     ax.set_xlabel("t", fontsize=14)
     ax.set_ylabel(ylabel, fontsize=14)
-    ax.legend()
+    ax.legend(loc="best")
     apply_line_grid(ax)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, filename), bbox_inches="tight")
@@ -183,6 +192,7 @@ def save_swe_rollout_visuals(
 
     fig_final, axes_final = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
     fig_err, axes_err = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+    first_ic_line = None
     for key, label in labels.items():
         ref_values = ref_primitive[key]
         save_xt_pdf(
@@ -219,18 +229,26 @@ def save_swe_rollout_visuals(
                 vmin=0.0,
                 vmax=max(float(err_values.max()), 1e-12),
             )
+        ic_line = add_ic_right_axis(ax_final, x, ref_values[0])
+        if first_ic_line is None:
+            first_ic_line = ic_line
         ax_final.set_ylabel(label, fontsize=14)
         apply_line_grid(ax_final)
         ax_err.set_ylabel(f"|{label} err|", fontsize=14)
         apply_line_grid(ax_err)
 
-    axes_final[0].legend()
+    handles, legend_labels = axes_final[0].get_legend_handles_labels()
+    if first_ic_line is not None:
+        handles.append(first_ic_line)
+        legend_labels.append("IC")
+    # axes_final[0].legend(handles, legend_labels, loc="lower left", bbox_to_anchor=(0.02, 0.12), borderaxespad=0.0)
+    axes_final[0].legend(handles, legend_labels, loc="upper right", bbox_to_anchor=(0.98, 0.55), borderaxespad=0.0)
     axes_final[-1].set_xlabel("x", fontsize=14)
     fig_final.tight_layout(rect=[0, 0, 1, 0.96])
     fig_final.savefig(os.path.join(outdir, f"final_solution{suffix}.pdf"), bbox_inches="tight")
     plt.close(fig_final)
 
-    axes_err[0].legend()
+    axes_err[0].legend(loc="best")
     axes_err[-1].set_xlabel("x", fontsize=14)
     fig_err.tight_layout(rect=[0, 0, 1, 0.96])
     fig_err.savefig(os.path.join(outdir, f"final_error{suffix}.pdf"), bbox_inches="tight")

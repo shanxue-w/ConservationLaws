@@ -29,6 +29,7 @@ torch.set_default_dtype(torch.float64)
 
 DEFAULT_FNO_CKPT = "checkpoints/burgers_fno_flowmap_dt_24.pt"
 LINE_GRID_ALPHA = 0.3
+XT_CMAP = "turbo"
 
 
 def apply_line_grid(ax) -> None:
@@ -90,10 +91,19 @@ def rel_linf(a, b, eps=1e-12):
 def display_model_name(name: str) -> str:
     return {
         "ref": "Ref",
-        "hybrid": "Hybrid",
+        "hybrid": "LGNO",
         "fno": "FNO",
         "cnn": "CNN",
     }.get(str(name).lower(), str(name))
+
+
+def add_ic_right_axis(ax, x: np.ndarray, values: np.ndarray):
+    ax_ic = ax.twinx()
+    (line,) = ax_ic.plot(x, values, label="IC", color="black", linestyle="--", lw=2)
+    ax_ic.set_ylabel("IC", fontsize=14, color="black")
+    ax_ic.tick_params(axis="y", colors="black")
+    ax_ic.grid(False)
+    return line
 
 
 def save_metric_curves_pdf(
@@ -117,7 +127,7 @@ def save_metric_curves_pdf(
     ax.set_yscale("log")
     ax.set_xlabel("t", fontsize=14)
     ax.set_ylabel(ylabel, fontsize=14)
-    ax.legend()
+    ax.legend(loc="best")
     apply_line_grid(ax)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, filename), bbox_inches="tight")
@@ -156,8 +166,8 @@ def save_scalar_xt_pdf(
     extent = [float(x[0]), float(x[-1] + dx), float(times[0]), float(times[-1])]
     fig, ax = plt.subplots(figsize=(5.6, 5.6))
     im = ax.imshow(values, origin="lower", aspect="auto", extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_xlabel("x")
-    ax.set_ylabel("t")
+    ax.set_xlabel("x", fontsize=14)
+    ax.set_ylabel("t", fontsize=14)
     ax.set_box_aspect(1)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
@@ -174,6 +184,7 @@ def save_scalar_rollout_visuals(
     *,
     suffix: str,
 ) -> None:
+    initial_ref = ref_traj[0]
     final_ref = ref_traj[-1]
     t_tag = f"T{times[-1]:g}".replace(".", "p")
 
@@ -183,16 +194,25 @@ def save_scalar_rollout_visuals(
         ref_traj,
         title="",
         path=os.path.join(outdir, f"xt_ref_{t_tag}{suffix}.pdf"),
-        cmap="viridis",
+        cmap=XT_CMAP,
+    )
+
+    save_scalar_profile_pdf(
+        x,
+        initial_ref,
+        ylabel="u",
+        path=os.path.join(outdir, f"initial_condition_{t_tag}{suffix}.pdf"),
     )
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(x, final_ref, label="Ref", lw=2)
     for name, pred_traj in pred_trajs.items():
         ax.plot(x, pred_traj[-1], label=display_model_name(name), lw=2)
+    ic_line = add_ic_right_axis(ax, x, initial_ref)
     ax.set_xlabel("x", fontsize=14)
     ax.set_ylabel("u", fontsize=14)
-    ax.legend()
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles + [ic_line], labels + ["IC"], loc="best")
     apply_line_grid(ax)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, f"final_solution_{t_tag}{suffix}.pdf"), bbox_inches="tight")
@@ -204,7 +224,7 @@ def save_scalar_rollout_visuals(
         ax.plot(x, final_err, label=f"{display_model_name(name)} error", lw=2)
     ax.set_xlabel("x", fontsize=14)
     ax.set_ylabel(r"$|u - u_{\text{ref}}|$", fontsize=14)
-    ax.legend()
+    ax.legend(loc="best")
     apply_line_grid(ax)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, f"final_error_{t_tag}{suffix}.pdf"), bbox_inches="tight")
@@ -218,7 +238,7 @@ def save_scalar_rollout_visuals(
             pred_traj,
             title="",
             path=os.path.join(outdir, f"xt_{name}_{t_tag}{suffix}.pdf"),
-            cmap="viridis",
+            cmap=XT_CMAP,
         )
         save_scalar_xt_pdf(
             x,
@@ -226,7 +246,7 @@ def save_scalar_rollout_visuals(
             xt_err,
             title="",
             path=os.path.join(outdir, f"xt_error_{name}_{t_tag}{suffix}.pdf"),
-            cmap="magma",
+            cmap=XT_CMAP,
             vmin=0.0,
             vmax=max(float(xt_err.max()), 1e-12),
         )
