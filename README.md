@@ -19,7 +19,6 @@ source.
 - `Euler/`: one-dimensional Euler benchmark.
 - `Burgers2D/`: two-dimensional Burgers benchmark.
 - `Euler2D/`: two-dimensional Euler benchmarks with periodic and outflow cases.
-- `paper_overleaf/`: LaTeX source for the paper.
 - `test.sh`: evaluation script for trained checkpoints.
 
 ## Installation
