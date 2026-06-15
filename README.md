@@ -86,10 +86,10 @@ cd ..
 
 ```bash
 cd Euler2D
-python -u train_periodic.py --allow_tf32 --num_workers 16 --epochs 200 --batch 16 --lr 5e-4
-python -u baseline_periodic.py --allow_tf32 --num_workers 16 --epochs 200 --batch 16 --lr 5e-4
-python -u train_pri.py --allow_tf32 --num_workers 16 --epochs 500 --batch 16 --lr 5e-4
-python -u baseline_pri.py --allow_tf32 --num_workers 16 --epochs 500 --batch 16 --lr 5e-4
+python -u train_periodic.py --allow_tf32 --num_workers 16 --epochs 200 --batch 16 --lr 5e-4 --save euler2d_hybrid_pri_outflow_1e-2_dt.pt
+python -u baseline_periodic.py --allow_tf32 --num_workers 16 --epochs 200 --batch 16 --lr 5e-4 --save euler2d_fno_pri_dt_24.pt
+python -u train_pri.py --allow_tf32 --num_workers 16 --epochs 500 --batch 16 --lr 5e-4 --save euler2d_hybrid_periodic_dt.pt
+python -u baseline_pri.py --allow_tf32 --num_workers 16 --epochs 500 --batch 16 --lr 5e-4 --save euler2d_fno_periodic_dt.pt
 cd ..
 ```
 

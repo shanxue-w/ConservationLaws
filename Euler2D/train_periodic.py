@@ -190,16 +190,26 @@ def main() -> None:
             )
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if args.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            try:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    args.grad_clip, 
+                    error_if_nonfinite=True
+                )
+                opt.step()
+                opt.zero_grad()
+            except RuntimeError as e:
+                if "non-finite" in str(e):
+                    print(f"Warning: Non-finite gradient detected at epoch {ep}, skipping batch.")
+                    opt.zero_grad()
+                else:
+                    raise e
             opt.step()
             tr_tot += loss.detach()
             tr_l1 += loss_l1.detach()
             tr_sp += loss_spec.detach()
             tr_lap += loss_lap.detach()
             nb += 1
-
-            print(f"ep: {ep}, batch: {nb}/{len(train_loader)}", end='\r')
 
         vm = evaluate_step_model(
             model,

@@ -179,7 +179,7 @@ def main() -> None:
             tr_sp += float(loss_spec.detach())
             tr_lap += float(loss_lap.detach())
             nb += 1
-            print(f"ep: {ep} batch: {nb}/{len(train_loader)}", end="\r")
+            # print(f"ep: {ep} batch: {nb}/{len(train_loader)}", end="\r")
 
         vm = evaluate_step_model(
             model,

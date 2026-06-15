@@ -70,7 +70,7 @@ def main() -> None:
     ap.add_argument("--width", type=int, default=64)
     ap.add_argument("--n_layers", type=int, default=4)
     ap.add_argument("--backbone", type=str, default="fno", choices=("fno", "cnn"))
-    ap.add_argument("--modes", type=int, default=32)
+    ap.add_argument("--modes", type=int, default=24)
     ap.add_argument("--modes2", type=int, default=0)
     ap.add_argument("--padding", type=int, default=4, help="FNO padding used for outflow.")
     ap.add_argument("--kernel_size", type=int, default=7, help="CNN kernel size.")
