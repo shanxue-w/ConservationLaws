@@ -79,48 +79,6 @@ DEFAULT_TIME_TEST_NAME = DEFAULT_TEST_NAME
 DEFAULT_HYBRID_CKPT = default_dt_ckpt_path("hybrid", "periodic")
 DEFAULT_FNO_CKPT = default_dt_ckpt_path("fno", "periodic")
 RIEMANN_DEMO_CONFIGS = {
-    "quad_shock": {
-        "description": (
-            "Primitive states stored as rho,u,v,p; converted from Lua p,rho,u,v. "
-            "Source: https://ammar-hakim.org/sj/sims/s398/s398-euler-reim-ds-2d.html"
-        ),
-        "split_x": 0.5,
-        "split_y": 0.5,
-        "states": {
-            "ul": (0.5197, -0.6259, -0.3, 0.4),
-            "ur": (1.0, 0.1, -0.3, 1.0),
-            "ll": (0.8, 0.1, -0.3, 0.4),
-            "lr": (0.5313, 0.1, 0.4276, 0.4),
-        },
-    },
-    "quad_shock_vacuum": {
-        "description": (
-            "Primitive states stored as rho,u,v,p; converted from Lua p,rho,u,v. "
-            "Source: https://ammar-hakim.org/sj/sims/s395/s395-euler-reim-ds-2d.html"
-        ),
-        "split_x": 0.5,
-        "split_y": 0.5,
-        "states": {
-            "ul": (0.5065, 0.8939, 0.0, 0.35),
-            "ur": (1.1, 0.0, 0.0, 1.1),
-            "ll": (1.1, 0.8939, 0.8939, 1.1),
-            "lr": (0.5065, 0.0, 0.8939, 0.35),
-        },
-    },
-    "quad_shock_s397": {
-        "description": (
-            "Primitive states stored as rho,u,v,p; converted from Lua p,rho,u,v. "
-            "Source: https://ammar-hakim.org/sj/sims/s397/s397-euler-reim-ds-2d.html"
-        ),
-        "split_x": 0.5,
-        "split_y": 0.5,
-        "states": {
-            "ul": (1.0, 0.7276, 0.0, 1.0),
-            "ur": (0.5313, 0.0, 0.0, 0.4),
-            "ll": (0.8, 0.0, 0.0, 1.0),
-            "lr": (1.0, 0.0, 0.7276, 1.0),
-        },
-    },
     "riemann_01": {
         "description": "Configuration 2. State indices map as 1=UR, 2=UL, 3=LL, 4=LR.",
         "split_x": 0.5,
