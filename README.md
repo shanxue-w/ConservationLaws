@@ -159,13 +159,5 @@ python eval_periodic_time.py --demo_riemann riemann_04 --rollout_steps 50 --allo
 cd ..
 ```
 
-Additional Euler2D periodic Riemann visualization demos can be run with:
-
-```bash
-cd Euler2D
-
-cd ..
-```
-
 Individual benchmark directories also provide `eval_time.py` scripts for timing
 experiments.
