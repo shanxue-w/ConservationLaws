@@ -43,6 +43,21 @@ LINE_GRID_ALPHA = 0.3
 XT_CMAP = "turbo"
 
 
+def time_suffix(T: float) -> str:
+    value = f"{float(T):g}"
+    value = value.replace("-", "m").replace("+", "").replace(".", "p")
+    return f"_T{value}"
+
+
+def rollout_plot_suffix(ic_tag: str, T: float) -> str:
+    return f"_{ic_tag}{time_suffix(T)}"
+
+
+def pdf_name_with_time_suffix(filename: str, T: float) -> str:
+    stem, ext = os.path.splitext(filename)
+    return f"{stem}{time_suffix(T)}{ext}"
+
+
 def apply_line_grid(ax) -> None:
     ax.grid(True, alpha=LINE_GRID_ALPHA, linewidth=0.8)
 
@@ -498,7 +513,7 @@ def main():
                     x_fine,
                     np.asarray(values, dtype=np.float64),
                     ylabel=label,
-                    path=os.path.join(plot_dir, f"u0_{s:04d}_{ic_type}_{key}.pdf"),
+                    path=os.path.join(plot_dir, pdf_name_with_time_suffix(f"u0_{s:04d}_{ic_type}_{key}.pdf", args.T)),
                 )
 
             snaps_hi = solve_euler_weno_ref(state0, times, dx_fine, bc=bc_eval, cfl=args.cfl)
@@ -549,15 +564,34 @@ def main():
         if l1_fno is not None and linf_fno is not None:
             l1_series["fno"] = l1_fno
             linf_series["fno"] = linf_fno
-        save_metric_curves_pdf(args.outdir, times, l1_series, metric_label="rel L1", filename="relL1_vs_time.pdf")
-        save_metric_curves_pdf(args.outdir, times, linf_series, metric_label="rel Linf", filename="relLinf_vs_time.pdf")
+        save_metric_curves_pdf(
+            args.outdir,
+            times,
+            l1_series,
+            metric_label="rel L1",
+            filename=pdf_name_with_time_suffix("relL1_vs_time.pdf", args.T),
+        )
+        save_metric_curves_pdf(
+            args.outdir,
+            times,
+            linf_series,
+            metric_label="rel Linf",
+            filename=pdf_name_with_time_suffix("relLinf_vs_time.pdf", args.T),
+        )
 
         if one_pack is not None:
             suf = "sod" if args.ic_mode == "sod" else f"seed{args.seed}"
             pred_trajs = {"hybrid": one_pack[2]}
             if len(one_pack) > 3 and one_pack[3] is not None:
                 pred_trajs["fno"] = one_pack[3]
-            save_euler_rollout_visuals(args.outdir, x_low, one_pack[0], one_pack[1], pred_trajs, suffix=f"_{suf}")
+            save_euler_rollout_visuals(
+                args.outdir,
+                x_low,
+                one_pack[0],
+                one_pack[1],
+                pred_trajs,
+                suffix=rollout_plot_suffix(suf, args.T),
+            )
 
         print(f"[rollout] saved csv: {rollout_summary_path}, {rollout_curves_path}")
 
