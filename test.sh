@@ -47,10 +47,10 @@ run_in_dir Euler2D python eval_pri.py --demo riemann_03 --eval_mode rollout --ro
 run_in_dir Euler2D python eval_pri.py --demo riemann_04 --eval_mode rollout --rollout_steps 25 --allow_tf32 --plot_one
 run_in_dir Euler2D python eval_periodic.py --allow_tf32 --eval_mode test
 run_in_dir Euler2D python eval_periodic.py --allow_tf32 --eval_mode rollout --n_samples 1 --plot_one --rollout_steps 50 --sample_seed 2 --share_ref_colorbar
-run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_01 --rollout_steps 50 --plot_one
-run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_02 --rollout_steps 50 --plot_one
-run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_03 --rollout_steps 50 --plot_one
-run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_04 --rollout_steps 50 --plot_one
+run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_01 --rollout_steps 50 --allow_tf32 --plot_one
+run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_02 --rollout_steps 50 --allow_tf32 --plot_one
+run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_03 --rollout_steps 50 --allow_tf32 --plot_one
+run_in_dir Euler2D python eval_periodic_time.py --demo_riemann riemann_04 --rollout_steps 50 --allow_tf32 --plot_one
 
 # Time evaluations
 run_in_dir PureConvection python eval_time.py --seed 2 --T 3 --solution_plot_format pdf

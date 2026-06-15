@@ -152,6 +152,10 @@ python eval_pri.py --demo riemann_01 --eval_mode rollout --rollout_steps 25 --al
 python eval_pri.py --demo riemann_02 --eval_mode rollout --rollout_steps 25 --allow_tf32 --plot_one
 python eval_pri.py --demo riemann_03 --eval_mode rollout --rollout_steps 25 --allow_tf32 --plot_one
 python eval_pri.py --demo riemann_04 --eval_mode rollout --rollout_steps 25 --allow_tf32 --plot_one
+python eval_periodic_time.py --demo_riemann riemann_01 --rollout_steps 50 --allow_tf32 --plot_one
+python eval_periodic_time.py --demo_riemann riemann_02 --rollout_steps 50 --allow_tf32 --plot_one
+python eval_periodic_time.py --demo_riemann riemann_03 --rollout_steps 50 --allow_tf32 --plot_one
+python eval_periodic_time.py --demo_riemann riemann_04 --rollout_steps 50 --allow_tf32 --plot_one
 cd ..
 ```
 
@@ -159,10 +163,7 @@ Additional Euler2D periodic Riemann visualization demos can be run with:
 
 ```bash
 cd Euler2D
-python eval_periodic_time.py --demo_riemann riemann_01 --rollout_steps 50 --plot_one
-python eval_periodic_time.py --demo_riemann riemann_02 --rollout_steps 50 --plot_one
-python eval_periodic_time.py --demo_riemann riemann_03 --rollout_steps 50 --plot_one
-python eval_periodic_time.py --demo_riemann riemann_04 --rollout_steps 50 --plot_one
+
 cd ..
 ```
 
