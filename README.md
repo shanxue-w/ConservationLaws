@@ -18,29 +18,29 @@ Paper: [arXiv:2606.18221](https://arxiv.org/abs/2606.18221)
   <tr>
     <td align="center" width="25%">
       <img src="figures/euler2d_ref_periodic_conserved_rho_WENO256.png" alt="WENO-Z 256^2 density field" width="100%">
-      <br><sub>WENO-Z 256^2</sub>
+      <br><sub>WENO-Z 256<sup>2</sup></sub>
     </td>
     <td align="center" width="25%">
       <img src="figures/euler2d_ref_periodic_conserved_rho.png" alt="WENO-Z 512^2 density field" width="100%">
-      <br><sub>WENO-Z 512^2</sub>
+      <br><sub>WENO-Z 512<sup>2</sup></sub>
     </td>
     <td align="center" width="25%">
       <img src="figures/euler2d_hybrid_periodic_conserved_rho.png" alt="LGNO 256^2 density field" width="100%">
-      <br><sub>LGNO 256^2</sub>
+      <br><sub>LGNO 256<sup>2</sup></sub>
     </td>
     <td align="center" width="25%">
       <img src="figures/euler2d_fno_periodic_conserved_rho.png" alt="FNO 256^2 density field" width="100%">
-      <br><sub>FNO 256^2</sub>
+      <br><sub>FNO 256<sup>2</sup></sub>
     </td>
   </tr>
 </table>
 
 **LGNO is less dissipative than WENO-Z at a higher resolution.** The density
 fields show the two-dimensional Euler equations after 50 autoregressive rollout
-steps with `Delta t = 0.01`. Trained only on short-time WENO-Z data at `512^2`
-resolution, LGNO on the coarse `256^2` grid preserves more vortical structures
+steps with $\Delta t=0.01$. Trained only on short-time WENO-Z data at $512^2$
+resolution, LGNO on the coarse $256^2$ grid preserves more vortical structures
 along contact discontinuities and shear layers than the WENO-Z references at
-both `256^2` and `512^2`, while the FNO baseline at `256^2` is severely degraded
+both $256^2$ and $512^2$, while the FNO baseline at $256^2$ is severely degraded
 over the long rollout.
 
 ## Repository Layout
