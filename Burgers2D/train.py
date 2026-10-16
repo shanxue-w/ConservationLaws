@@ -149,18 +149,22 @@ def make_u_pair_loader(
 
 
 def high_freq_error_loss_2d(u_pred, u_target, k_frac: float = 0.25):
-    if k_frac <= 0.0:
+    if k_frac <= 0.0 or k_frac >= 1.0:
         return u_pred.new_tensor(0.0)
     err = (u_pred - u_target).squeeze(-1)
     err_ft = torch.fft.rfftn(err, dim=(1, 2))
-    H, Wh = err_ft.shape[1], err_ft.shape[2]
-    ky0 = int(H * k_frac)
-    kx0 = int(Wh * k_frac)
-    mask_y = torch.arange(H, device=err.device)[:, None] >= ky0
-    mask_x = torch.arange(Wh, device=err.device)[None, :] >= kx0
-    mask = mask_y | mask_x
-    spec = err_ft * mask[None, :, :]
-    return (spec.abs() ** 2).mean()
+    H, W = err.shape[1], err.shape[2]
+    ky = torch.fft.fftfreq(H, device=err.device, dtype=err.dtype).abs()
+    kx = torch.fft.rfftfreq(W, device=err.device, dtype=err.dtype)
+    # Use the same fraction of the Nyquist frequency in both directions.
+    mask = (ky[:, None] >= 0.5 * k_frac) | (kx[None, :] >= 0.5 * k_frac)
+    weights = torch.full_like(kx, 2.0)
+    weights[0] = 1.0
+    if W % 2 == 0:
+        weights[-1] = 1.0
+    energy = err_ft.abs().square() * mask[None, :, :] * weights
+    # Parseval: summed squared error per grid, averaged over samples.
+    return energy.sum(dim=(1, 2)).mean() / (H * W)
 
 
 def periodic_laplacian_sq_2d(z):
@@ -254,7 +258,7 @@ def main():
     ap.add_argument(
         "--compile_mode",
         type=str,
-        default="auto",
+        default="max-autotune",
         choices=("auto", "default", "reduce-overhead", "max-autotune"),
     )
     args = ap.parse_args()

@@ -208,19 +208,22 @@ def outflow_laplacian_sq_2d(z: torch.Tensor) -> torch.Tensor:
 
 
 def high_freq_error_loss_2d(pred: torch.Tensor, target: torch.Tensor, k_frac: float = 0.25) -> torch.Tensor:
-    if k_frac <= 0.0:
+    if k_frac <= 0.0 or k_frac >= 1.0:
         return pred.new_tensor(0.0)
     err = (pred - target).permute(0, 3, 1, 2).contiguous()
     err_ft = torch.fft.rfftn(err, dim=(2, 3))
-    h, w_half = err_ft.shape[2], err_ft.shape[3]
-    ky0 = int(h * k_frac)
-    kx0 = int(w_half * k_frac)
-    if ky0 >= h and kx0 >= w_half:
-        return pred.new_tensor(0.0)
-    mask_y = torch.arange(h, device=pred.device)[:, None] >= ky0
-    mask_x = torch.arange(w_half, device=pred.device)[None, :] >= kx0
-    mask = mask_y | mask_x
-    return ((err_ft * mask[None, None]).abs() ** 2).mean()
+    h, w = err.shape[2], err.shape[3]
+    ky = torch.fft.fftfreq(h, device=err.device, dtype=err.dtype).abs()
+    kx = torch.fft.rfftfreq(w, device=err.device, dtype=err.dtype)
+    # Use the same fraction of the Nyquist frequency in both directions.
+    mask = (ky[:, None] >= 0.5 * k_frac) | (kx[None, :] >= 0.5 * k_frac)
+    weights = torch.full_like(kx, 2.0)
+    weights[0] = 1.0
+    if w % 2 == 0:
+        weights[-1] = 1.0
+    energy = err_ft.abs().square() * mask[None, None] * weights
+    # Parseval: summed squared error per grid, averaged over samples/channels.
+    return energy.sum(dim=(2, 3)).mean() / (h * w)
 
 
 def rel_l1_loss_per_channel_2d(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
