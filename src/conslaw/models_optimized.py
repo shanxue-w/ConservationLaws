@@ -3,7 +3,11 @@ Neural operators for conservation-law surrogates: FNO, CNN (periodic / outflow),
 and hybrid (spectral + multi-resolution local + gated mix) in 1D and 2D.
 
 Opt-in LGNO variant with tanh-bounded interaction factors and equivalent fusion
-optimizations. The original ``conslaw.models`` module remains unchanged.
+optimizations. The original ``conslaw.models`` module remains unchanged. The 2D
+hybrid trunk keeps its hidden state channels-last in ``(B, Ny, Nx, C)``: 1x1 convs run
+as ``F.linear``, spatial convs read channels-last views, ``mix`` is accumulated
+blockwise with ``addmm`` instead of concatenating, and the spectral layer is
+:class:`RealSpectralConv2dModeMajor`, whose cuFFT ops stay inside the compiled graph.
 
 Boundary conventions
 --------------------
@@ -54,7 +58,13 @@ def maybe_torch_compile(
     else:
         mode = compile_mode
     try:
-        return torch.compile(model, mode=mode, fullgraph=fullgraph, dynamic=False)
+        from torch._inductor import list_mode_options
+
+        # Inductor's layout optimization can re-stride a complex FFT intermediate with a
+        # generated Triton copy, which has no complex dtype (KeyError: 'complex64'). The
+        # 2D trunk already hands its convs channels-last tensors, so nothing is lost.
+        options = {**list_mode_options(mode), "layout_optimization": False}
+        return torch.compile(model, options=options, fullgraph=fullgraph, dynamic=False)
     except Exception as exc:
         print(f"[compile] torch.compile skipped ({exc}).")
         return model
@@ -101,7 +111,7 @@ def _broadcast_dt_1d(dt: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
 # Same mathematics as a complex weight matrix on low Fourier modes, but parameters are
 # stored as (W_r, W_i) and combined as in complex multiplication. This keeps
 # ``torch.compile`` from routing complex dtypes through Inductor. ``@dynamo.disable``
-# keeps rfft/irfft + spectrum ops eager.
+# keeps rfft/irfft + spectrum ops eager, except in :class:`RealSpectralConv2dModeMajor`.
 
 
 class RealSpectralConv1d(nn.Module):
@@ -203,6 +213,72 @@ class RealSpectralConv2d(nn.Module):
         sl2 = x_ft[:, :, -m1:, :m2]
         out_ft[:, :, -m1:, :m2] = _cmpl_block(sl2, self.weights2_r, self.weights2_i)
         y = torch.fft.irfftn(out_ft, s=(H, W), dim=(-2, -1))
+        if pad > 0:
+            y = y[..., pad:-pad, pad:-pad]
+        return y
+
+
+def _mode_major(w: torch.Tensor) -> torch.Tensor:
+    """Same values and shape ``(i, o, m1, m2)``, stored in memory as ``(m1, m2, i, o)``."""
+    return w.permute(2, 3, 0, 1).contiguous().permute(2, 3, 0, 1)
+
+
+class RealSpectralConv2dModeMajor(nn.Module):
+    """
+    Drop-in for :class:`RealSpectralConv2d`: same parameters, init, state-dict keys and
+    shapes, and the same map up to rounding, with fewer copies per call.
+
+    * Weights are stored mode-major, so each mode's ``(i, o)`` matrix is contiguous and
+      the channel mixing is a batched matmul on views. ``RealSpectralConv2d``'s einsum
+      re-lays out all four weight tensors on every call. Loading a state dict keeps
+      this layout; any other layout is still correct, only slower.
+    * Real and imaginary rows share one matmul per weight tensor.
+    * Only the retained ``ky`` columns are transformed along ``H``, and the inverse
+      ``H`` transform runs on those columns before the zero-padded ``irfft`` along ``W``.
+    * Unlike the other spectral layers, ``forward`` is not ``@dynamo.disable``: the cuFFT
+      calls run as eager fallbacks inside the compiled graph, so the trunk compiles
+      without graph breaks, and their gradients come from PyTorch's FFT autograd. Compile
+      with Inductor's ``layout_optimization`` off, as :func:`maybe_torch_compile` does.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int, *, pad: int = 0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.pad = int(pad)
+        scale = 1.0 / (in_channels * out_channels)
+        shp = (in_channels, out_channels, modes1, modes2)
+        self.weights1_r = nn.Parameter(_mode_major(scale * torch.randn(*shp)))
+        self.weights1_i = nn.Parameter(_mode_major(scale * torch.randn(*shp)))
+        self.weights2_r = nn.Parameter(_mode_major(scale * torch.randn(*shp)))
+        self.weights2_i = nn.Parameter(_mode_major(scale * torch.randn(*shp)))
+
+    @staticmethod
+    def _mix(xs: torch.Tensor, wr: torch.Tensor, wi: torch.Tensor) -> torch.Tensor:
+        """``(B, i, m1, m2)`` complex modes times ``(i, o, m1, m2)`` weights -> ``(B, o, m1, m2)``."""
+        B, C, m1, m2 = xs.shape
+        x2 = torch.view_as_real(xs).permute(2, 3, 4, 0, 1).reshape(m1 * m2, 2 * B, C)
+        wr = wr[:, :, :m1, :m2].to(dtype=x2.dtype).permute(2, 3, 0, 1).reshape(m1 * m2, C, -1)
+        wi = wi[:, :, :m1, :m2].to(dtype=x2.dtype).permute(2, 3, 0, 1).reshape(m1 * m2, C, -1)
+        p = torch.bmm(x2, wr)
+        q = torch.bmm(x2, wi)
+        out = torch.complex(p[:, :B] - q[:, B:], q[:, :B] + p[:, B:])
+        return out.reshape(m1, m2, B, -1).permute(2, 3, 0, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad = self.pad
+        if pad > 0:
+            x = F.pad(x, (pad, pad, pad, pad))
+        B, _, H, W = x.shape
+        m1 = min(self.modes1, H)
+        m2 = min(self.modes2, W // 2 + 1)
+        x_ft = torch.fft.fft(torch.fft.rfft(x, dim=-1)[..., :m2], dim=-2)
+        out_ft = x_ft.new_zeros(B, self.out_channels, H, m2)
+        out_ft[:, :, :m1] = self._mix(x_ft[:, :, :m1], self.weights1_r, self.weights1_i)
+        out_ft[:, :, -m1:] = self._mix(x_ft[:, :, -m1:], self.weights2_r, self.weights2_i)
+        y = torch.fft.irfft(torch.fft.ifft(out_ft, dim=-2), n=W, dim=-1)
         if pad > 0:
             y = y[..., pad:-pad, pad:-pad]
         return y
@@ -596,17 +672,53 @@ class HybridBackbone1d(nn.Module):
         return {"tilde_rhs": tilde_rhs, "h": h}
 
 
+def _pointwise(x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
+    """1x1 ``conv`` on channels-last ``(..., C)``: one GEMM with the bias fused in."""
+    return F.linear(x, conv.weight.flatten(1), conv.bias)
+
+
+def _conv2d_nhwc(x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
+    """Unpadded ``conv`` on ``(B, H, W, C)``; cuDNN reads the permuted view as channels-last."""
+    return F.conv2d(x.permute(0, 3, 1, 2), conv.weight, conv.bias).permute(0, 2, 3, 1)
+
+
+def _pad_nhwc(x: torch.Tensor, p: int, mode: str) -> torch.Tensor:
+    """``F.pad(..., mode)`` by ``p`` on both spatial axes of ``(B, H, W, C)``, staying channels-last."""
+    if mode == "circular":
+        x = torch.cat([x[:, :, -p:], x, x[:, :, :p]], dim=2)
+        return torch.cat([x[:, -p:], x, x[:, :p]], dim=1)
+    if mode == "replicate":
+        x = torch.cat([x[:, :, :1].expand(-1, -1, p, -1), x, x[:, :, -1:].expand(-1, -1, p, -1)], dim=2)
+        return torch.cat([x[:, :1].expand(-1, p, -1, -1), x, x[:, -1:].expand(-1, p, -1, -1)], dim=1)
+    raise ValueError(f"Unsupported padding mode {mode!r}")
+
+
+def _mr_local_2d(op: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Shared MR-local body on ``(B, H, W, C)``; ``op._conv_block(y, i)`` applies padded conv ``i``."""
+    B, H, W, C = x.shape
+    if H % 2 != 0 or W % 2 != 0:
+        raise ValueError(f"MRLocal2d needs even H,W; got ({H}, {W})")
+    x1 = F.avg_pool2d(x.permute(0, 3, 1, 2), kernel_size=2, stride=2).permute(0, 2, 3, 1)
+    y = F.silu(op._conv_block(x1, 0))
+    y = F.silu(op._conv_block(y, 1))
+    w_fine, w_coarse = op.fuse.weight.flatten(1).split(C, dim=1)
+    coarse = F.linear(y, w_coarse)
+    # Channel projection commutes with spatial bilinear interpolation.
+    coarse = F.interpolate(coarse.permute(0, 3, 1, 2), size=(H, W), mode="bilinear", align_corners=False)
+    return F.linear(x, w_fine, op.fuse.bias) + coarse.permute(0, 2, 3, 1)
+
+
 class _SpectralOp2d(nn.Module):
     def __init__(self, width: int, modes1: int, modes2: int, *, bc: str = "periodic", spectral_pad: int = 4):
         super().__init__()
         pad = 0 if bc == "periodic" else int(spectral_pad)
-        self.spec = RealSpectralConv2d(width, width, modes1, modes2, pad=pad)
+        self.spec = RealSpectralConv2dModeMajor(width, width, modes1, modes2, pad=pad)
         self.w = nn.Conv2d(width, width, kernel_size=1)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        x = h.permute(0, 3, 1, 2).contiguous()
-        y = self.spec(x) + self.w(x)
-        return y.permute(0, 2, 3, 1).contiguous()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, H, W, C) -> (B, H, W, C)``."""
+        y = self.spec(x.permute(0, 3, 1, 2).contiguous())
+        return _pointwise(x, self.w) + y.permute(0, 2, 3, 1)
 
 class _MRLocalOp2d(nn.Module):
     def __init__(self, width: int, kernel_size: int = 5, *, bc: str = "periodic"):
@@ -618,21 +730,13 @@ class _MRLocalOp2d(nn.Module):
         self.conv_low2 = nn.Conv2d(width, width, kernel_size=kernel_size, padding=p, padding_mode=pmode)
         self.fuse = nn.Conv2d(2 * width, width, kernel_size=1)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        x = h.permute(0, 3, 1, 2).contiguous()
-        H, W = x.shape[-2], x.shape[-1]
-        if H % 2 != 0 or W % 2 != 0:
-            raise ValueError(f"MRLocal2d needs even H,W; got ({H}, {W})")
-        x1 = F.avg_pool2d(x, kernel_size=2, stride=2)
-        y = F.silu(self.conv_low(x1))
-        y = F.silu(self.conv_low2(y))
-        width = x.size(1)
-        fine = F.conv2d(x, self.fuse.weight[:, :width], self.fuse.bias)
-        coarse = F.conv2d(y, self.fuse.weight[:, width:])
-        # Channel projection commutes with spatial bilinear interpolation.
-        coarse = F.interpolate(coarse, size=(H, W), mode="bilinear", align_corners=False)
-        out = fine + coarse
-        return out.permute(0, 2, 3, 1).contiguous()
+    def _conv_block(self, x: torch.Tensor, i: int) -> torch.Tensor:
+        conv = self.conv_low2 if i else self.conv_low
+        return _conv2d_nhwc(_pad_nhwc(x, conv.padding[0], conv.padding_mode), conv)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, H, W, C) -> (B, H, W, C)``."""
+        return _mr_local_2d(self, x)
 
 class _LearnedGhostPadX(nn.Module):
     """Predict left/right ghost columns from a boundary-adjacent interior strip."""
@@ -652,24 +756,24 @@ class _LearnedGhostPadX(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        """``(B, H, W, C) -> (B, H, ghost_width, C)``."""
+        B, H, W, C = x.shape
         if C != self.channels:
             raise ValueError(f"Expected channels={self.channels}, got {C}")
-        if self.side == "left":
-            if W < self.ctx_width:
-                ctx = F.pad(x, (0, self.ctx_width - W, 0, 0), mode="replicate")[..., : self.ctx_width]
+        cw = self.ctx_width
+        if W < cw:  # replicate-pad the strip away from the boundary
+            if self.side == "left":
+                ctx = torch.cat([x, x[:, :, -1:].expand(-1, -1, cw - W, -1)], dim=2)
             else:
-                ctx = x[..., : self.ctx_width]
+                ctx = torch.cat([x[:, :, :1].expand(-1, -1, cw - W, -1), x], dim=2)
         else:
-            if W < self.ctx_width:
-                ctx = F.pad(x, (self.ctx_width - W, 0, 0, 0), mode="replicate")[..., -self.ctx_width :]
-            else:
-                ctx = x[..., -self.ctx_width :]
-
-        ghost = self.net(ctx)
-        ghost = ghost.squeeze(-1).contiguous()
-        ghost = ghost.view(B, C, self.ghost_width, H).permute(0, 1, 3, 2).contiguous()
-        return ghost
+            ctx = x[:, :, :cw] if self.side == "left" else x[:, :, -cw:]
+        conv1, conv2 = self.net[0], self.net[2]
+        # The (1, ctx_width) conv is a linear map of each row's flattened (ctx_width, C) strip.
+        w1 = conv1.weight[:, :, 0].transpose(1, 2).reshape(C, cw * C)
+        hid = F.silu(F.linear(ctx.reshape(B, H, cw * C), w1, conv1.bias))
+        ghost = _pointwise(hid, conv2)  # (B, H, C * ghost_width), channel-major as in NCHW
+        return ghost.view(B, H, C, self.ghost_width).transpose(-1, -2)
 
 
 class _LearnedGhostPadY(nn.Module):
@@ -690,24 +794,24 @@ class _LearnedGhostPadY(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        """``(B, H, W, C) -> (B, ghost_width, W, C)``."""
+        B, H, W, C = x.shape
         if C != self.channels:
             raise ValueError(f"Expected channels={self.channels}, got {C}")
-        if self.side == "top":
-            if H < self.ctx_width:
-                ctx = F.pad(x, (0, 0, 0, self.ctx_width - H), mode="replicate")[:, :, : self.ctx_width, :]
+        cw = self.ctx_width
+        if H < cw:  # replicate-pad the strip away from the boundary
+            if self.side == "top":
+                ctx = torch.cat([x, x[:, -1:].expand(-1, cw - H, -1, -1)], dim=1)
             else:
-                ctx = x[:, :, : self.ctx_width, :]
+                ctx = torch.cat([x[:, :1].expand(-1, cw - H, -1, -1), x], dim=1)
         else:
-            if H < self.ctx_width:
-                ctx = F.pad(x, (0, 0, self.ctx_width - H, 0), mode="replicate")[:, :, -self.ctx_width :, :]
-            else:
-                ctx = x[:, :, -self.ctx_width :, :]
-
-        ghost = self.net(ctx)
-        ghost = ghost.squeeze(-2).contiguous()
-        ghost = ghost.view(B, C, self.ghost_width, W).contiguous()
-        return ghost
+            ctx = x[:, :cw] if self.side == "top" else x[:, -cw:]
+        conv1, conv2 = self.net[0], self.net[2]
+        # The (ctx_width, 1) conv is a linear map of each column's flattened (ctx_width, C) strip.
+        w1 = conv1.weight[..., 0].transpose(1, 2).reshape(C, cw * C)
+        hid = F.silu(F.linear(ctx.transpose(1, 2).reshape(B, W, cw * C), w1, conv1.bias))
+        ghost = _pointwise(hid, conv2)  # (B, W, C * ghost_width), channel-major as in NCHW
+        return ghost.view(B, W, C, self.ghost_width).permute(0, 3, 1, 2)
 
 
 class _MRLocalOp2dOutflow(nn.Module):
@@ -758,7 +862,7 @@ class _MRLocalOp2dOutflow(nn.Module):
             )
 
     def _pad_periodic(self, x: torch.Tensor) -> torch.Tensor:
-        return F.pad(x, (self.p, self.p, self.p, self.p), mode="circular")
+        return _pad_nhwc(x, self.p, "circular")
 
     def _pad_outflow(
         self,
@@ -768,10 +872,10 @@ class _MRLocalOp2dOutflow(nn.Module):
     ) -> torch.Tensor:
         g_left = ghost_x["left"](x)
         g_right = ghost_x["right"](x)
-        x_lr = torch.cat([g_left, x, g_right], dim=-1)
+        x_lr = torch.cat([g_left, x, g_right], dim=2)
         g_top = ghost_y["top"](x_lr)
         g_bottom = ghost_y["bottom"](x_lr)
-        return torch.cat([g_top, x_lr, g_bottom], dim=-2)
+        return torch.cat([g_top, x_lr, g_bottom], dim=1)
 
     def _apply_conv_block(
         self,
@@ -786,26 +890,47 @@ class _MRLocalOp2dOutflow(nn.Module):
             if ghost_x is None or ghost_y is None:
                 raise ValueError("Outflow padding requires ghost predictors.")
             x_pad = self._pad_outflow(x, ghost_x, ghost_y)
-        return conv(x_pad)
+        return _conv2d_nhwc(x_pad, conv)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        x = h.permute(0, 3, 1, 2).contiguous()
-        H, W = x.shape[-2], x.shape[-1]
-        if H % 2 != 0 or W % 2 != 0:
-            raise ValueError(f"MRLocal2d needs even H,W; got ({H}, {W})")
-        x1 = F.avg_pool2d(x, kernel_size=2, stride=2)
+    def _conv_block(self, x: torch.Tensor, i: int) -> torch.Tensor:
+        conv = self.conv_low2 if i else self.conv_low
         if self.bc == "periodic":
-            y = F.silu(self._apply_conv_block(x1, self.conv_low))
-            y = F.silu(self._apply_conv_block(y, self.conv_low2))
-        else:
-            y = F.silu(self._apply_conv_block(x1, self.conv_low, self.ghost1_x, self.ghost1_y))
-            y = F.silu(self._apply_conv_block(y, self.conv_low2, self.ghost2_x, self.ghost2_y))
-        width = x.size(1)
-        fine = F.conv2d(x, self.fuse.weight[:, :width], self.fuse.bias)
-        coarse = F.conv2d(y, self.fuse.weight[:, width:])
-        coarse = F.interpolate(coarse, size=(H, W), mode="bilinear", align_corners=False)
-        out = fine + coarse
-        return out.permute(0, 2, 3, 1).contiguous()
+            return self._apply_conv_block(x, conv)
+        ghost_x, ghost_y = (self.ghost2_x, self.ghost2_y) if i else (self.ghost1_x, self.ghost1_y)
+        return self._apply_conv_block(x, conv, ghost_x, ghost_y)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, H, W, C) -> (B, H, W, C)``."""
+        return _mr_local_2d(self, x)
+
+
+def _hybrid_trunk_2d(
+    backbone: HybridBackbone2d | HybridBackbone2dOutflow, u: torch.Tensor
+) -> Dict[str, torch.Tensor]:
+    """
+    Shared 2D trunk. The hidden state stays channels-last in ``(B, Ny, Nx, C)``, so
+    every 1x1 conv is one GEMM, and ``mix(cat[h, g, l, c])`` is accumulated as the sum
+    of its per-branch 1x1 blocks with ``addmm``. Returns ``tilde_rhs`` and ``h``.
+    """
+    if u.dim() != 4 or u.size(-1) != backbone.in_channels:
+        raise ValueError(f"Expected u (B, Ny, Nx, {backbone.in_channels}), got {tuple(u.shape)}")
+    C = backbone.width
+    h = F.silu(_pointwise(u, backbone.lift))
+    for t in range(backbone.n_layers):
+        g = F.silu(backbone.spec_ops[t](h))
+        lfeat = F.silu(backbone.mr_local_ops[t](h))
+        c = torch.tanh(_pointwise(g, backbone.w_g[t])) * torch.tanh(_pointwise(lfeat, backbone.w_l[t]))
+        mix = backbone.mix[t]
+        w_h, w_g, w_l, w_c = mix.weight.flatten(1).split(C, dim=1)
+        acc = torch.addmm(mix.bias, h.reshape(-1, C), w_h.t())
+        acc = acc.addmm(g.reshape(-1, C), w_g.t())
+        acc = acc.addmm(lfeat.reshape(-1, C), w_l.t())
+        acc = acc.addmm(c.reshape(-1, C), w_c.t())
+        h = h + acc.view_as(h)
+    head = backbone.head
+    tilde_rhs = _pointwise(F.silu(_pointwise(h, head[0])), head[2])
+    return {"tilde_rhs": tilde_rhs, "h": h}
+
 
 class HybridBackbone2d(nn.Module):
     """Spectral + MR-local + gated trunk: ``u -> {tilde_rhs, h}``.
@@ -850,25 +975,7 @@ class HybridBackbone2d(nn.Module):
         )
 
     def forward(self, u: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if u.dim() != 4 or u.size(-1) != self.in_channels:
-            raise ValueError(f"Expected u (B, Ny, Nx, {self.in_channels}), got {tuple(u.shape)}")
-        x = u.permute(0, 3, 1, 2).contiguous()
-        h = self.lift(x)
-        h = h.permute(0, 2, 3, 1).contiguous()
-        h = F.silu(h)
-        for t in range(self.n_layers):
-            g = F.silu(self.spec_ops[t](h))
-            lfeat = F.silu(self.mr_local_ops[t](h))
-            hp = h.permute(0, 3, 1, 2)
-            gp = g.permute(0, 3, 1, 2)
-            lp = lfeat.permute(0, 3, 1, 2)
-            gc = self.w_g[t](gp)
-            lc = self.w_l[t](lp)
-            c = torch.tanh(gc) * torch.tanh(lc)
-            z = torch.cat([hp, gp, lp, c], dim=1)
-            h = h + self.mix[t](z).permute(0, 2, 3, 1)
-        tilde_rhs = self.head(h.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
-        return {"tilde_rhs": tilde_rhs, "h": h}
+        return _hybrid_trunk_2d(self, u)
 
 class HybridBackbone2dOutflow(nn.Module):
     """
@@ -918,25 +1025,7 @@ class HybridBackbone2dOutflow(nn.Module):
         )
 
     def forward(self, u: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if u.dim() != 4 or u.size(-1) != self.in_channels:
-            raise ValueError(f"Expected u (B, Ny, Nx, {self.in_channels}), got {tuple(u.shape)}")
-        x = u.permute(0, 3, 1, 2).contiguous()
-        h = self.lift(x)
-        h = h.permute(0, 2, 3, 1).contiguous()
-        h = F.silu(h)
-        for t in range(self.n_layers):
-            g = F.silu(self.spec_ops[t](h))
-            lfeat = F.silu(self.mr_local_ops[t](h))
-            hp = h.permute(0, 3, 1, 2)
-            gp = g.permute(0, 3, 1, 2)
-            lp = lfeat.permute(0, 3, 1, 2)
-            gc = self.w_g[t](gp)
-            lc = self.w_l[t](lp)
-            c = torch.tanh(gc) * torch.tanh(lc)
-            z = torch.cat([hp, gp, lp, c], dim=1)
-            h = h + self.mix[t](z).permute(0, 2, 3, 1)
-        tilde_rhs = self.head(h.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
-        return {"tilde_rhs": tilde_rhs, "h": h}
+        return _hybrid_trunk_2d(self, u)
 
 class PeriodicRhs2d(nn.Module):
     """Periodic domain: optionally subtract spatial mean per channel (mass-conserving residual)."""
@@ -1337,6 +1426,7 @@ __all__ = [
     "PeriodicCNN2d",
     "RealSpectralConv1d",
     "RealSpectralConv2d",
+    "RealSpectralConv2dModeMajor",
     "state_dict_for_ckpt",
     "zero_mean_rhs_1d",
     "zero_mean_rhs_2d",
